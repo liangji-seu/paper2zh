@@ -1,0 +1,36 @@
+# Private local state: credentials, papers, generated translations and jobs
+data/
+.env
+.env.*
+!.env.example
+*.pdf
+*.log
+*.key
+*.pem
+# Environments, downloaded models and caches
+.venv/
+venv/
+.runtime*/
+.cache/
+.uv/
+.venv-*/
+.babeldoc/
+models/
+downloads/
+outputs/
+rendered/
+artifacts/
+test-artifacts/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+node_modules/
+dist/
+build/
+.coverage
+htmlcov/
+.DS_Store
+Thumbs.db

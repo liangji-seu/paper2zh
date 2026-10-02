@@ -1,0 +1,1 @@
+"""Local paper translation reader."""
