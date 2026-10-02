@@ -1,0 +1,99 @@
+name: Build and publish Windows release
+
+on:
+  push:
+    tags:
+      - "v1.0.0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build Windows installer and Release assets
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run unit tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile Python modules
+        shell: pwsh
+        run: python -m compileall -q app run.py babeldoc_local.py
+
+      - name: Check JavaScript syntax
+        shell: pwsh
+        run: |
+          node --check static/workspace.mjs
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: .\packaging\build.ps1 -BuildPython python
+
+      - name: Check bundled engine independently
+        shell: pwsh
+        run: |
+          $engine = "packaging/stage/paper2zh/_internal/engine/python.exe"
+          $entry = "packaging/stage/paper2zh/_internal/babeldoc_local.py"
+          if (-not (Test-Path -LiteralPath $engine)) { throw "Bundled engine missing: $engine" }
+          if (-not (Test-Path -LiteralPath $entry)) { throw "Bundled engine entrypoint missing: $entry" }
+          & $engine $entry --help
+          if ($LASTEXITCODE -ne 0) { throw "Bundled engine --help check failed." }
+
+      - name: Verify installer and write SHA256
+        shell: pwsh
+        run: |
+          $installer = "packaging/output/paper2zh-Setup-1.0.0-win64.exe"
+          if (-not (Test-Path -LiteralPath $installer)) {
+            throw "Installer was not produced: $installer"
+          }
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          $name = Split-Path -Leaf $installer
+          "$hash  $name" | Set-Content -LiteralPath "packaging/output/SHA256SUMS.txt" -Encoding ascii
+          Get-Content -LiteralPath "packaging/output/SHA256SUMS.txt"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper2zh-v1.0.0-windows
+          path: |
+            packaging/output/paper2zh-Setup-1.0.0-win64.exe
+            packaging/output/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $installer = "packaging/output/paper2zh-Setup-1.0.0-win64.exe"
+          $checksums = "packaging/output/SHA256SUMS.txt"
+          $notes = ".github/release-notes/v1.0.0.md"
+          gh release create "${env:GITHUB_REF_NAME}" $installer $checksums `
+            --repo "${env:GITHUB_REPOSITORY}" `
+            --title "paper2zh v1.0.0" `
+            --notes-file $notes `
+            --verify-tag

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import queue
 import re
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,13 +19,17 @@ from urllib.parse import urlparse
 from pypdf import PdfReader
 
 from .security import mask, protect, unprotect
+from .progress import parse_engine_progress
 
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA = ROOT / "data"
+_configured_data = os.environ.get("PAPER_TRANSLATOR_DATA_DIR", "").strip()
+DATA = Path(_configured_data).expanduser() if _configured_data else ROOT / "data"
 JOBS = DATA / "jobs"
 SETTINGS_PATH = DATA / "settings.json"
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_LOCAL_IMPORT_BYTES = MAX_UPLOAD_BYTES
+EXTERNAL_SOURCE_META_NAME = "external-source.json"
 
 DEFAULT_SETTINGS = {
     "provider": "DeepSeek",
@@ -100,6 +107,397 @@ def safe_filename(name: str) -> str:
     if not name.lower().endswith(".pdf"):
         name += ".pdf"
     return name[:180] or "paper.pdf"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _atomic_copy(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _translation_meta_path(job: dict[str, Any]) -> Path:
+    return JOBS / job["id"] / "translation-meta.json"
+
+
+def _external_source_meta_path(job: dict[str, Any]) -> Path:
+    # Kept outside job.json so a normal HTTP job response never contains the
+    # user's original absolute path. Only native-import translation code reads
+    # this private per-job record.
+    return JOBS / job["id"] / EXTERNAL_SOURCE_META_NAME
+
+
+def _write_external_source(job: dict[str, Any], source: Path) -> None:
+    target = _external_source_meta_path(job)
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps({"path": str(source)}, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_external_source(job: dict[str, Any]) -> Path | None:
+    try:
+        payload = json.loads(_external_source_meta_path(job).read_text(encoding="utf-8"))
+        raw_path = payload.get("path")
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    try:
+        source = Path(raw_path).resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+    return source if source.is_file() and source.suffix.lower() == ".pdf" else None
+
+
+def _read_translation_meta(job: dict[str, Any]) -> dict[str, Any]:
+    try:
+        payload = json.loads(_translation_meta_path(job).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _job_relative_file(job: dict[str, Any], relative: Any) -> Path | None:
+    if not isinstance(relative, str) or not relative:
+        return None
+    job_dir = (JOBS / job["id"]).resolve()
+    candidate = (job_dir / relative).resolve()
+    try:
+        candidate.relative_to(job_dir)
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _translation_is_current(job: dict[str, Any]) -> bool:
+    if not job.get("source_sha256"):
+        return False
+    source = JOBS / job["id"] / "source.pdf"
+    if not source.is_file():
+        return False
+    meta = _read_translation_meta(job)
+    if meta.get("source_sha256") != job.get("source_sha256") or meta.get("source_sha256") != _sha256(source):
+        return False
+    if meta.get("scope") not in {"full", "trial", "demo"}:
+        return False
+    translated = _job_relative_file(job, meta.get("translated_file"))
+    bilingual = _job_relative_file(job, meta.get("bilingual_file"))
+    if not translated or not bilingual:
+        return False
+    return meta.get("translated_sha256") == _sha256(translated) and meta.get("bilingual_sha256") == _sha256(bilingual)
+
+
+def _full_translation_paths(job: dict[str, Any]) -> tuple[Path, Path]:
+    job_dir = JOBS / job["id"]
+    stem = Path(job["filename"]).stem
+    target_dir = job_dir / "translate"
+    return target_dir / f"{stem}.zh.pdf", target_dir / f"{stem}.zh.bilingual.pdf"
+
+
+def _redact_engine_line(line: str, api_key: str = "") -> str:
+    if api_key:
+        line = line.replace(api_key, "[REDACTED]")
+    return re.sub(r"sk-[A-Za-z0-9_-]+", "[REDACTED]", line)
+
+
+def _apply_progress_event(job: dict[str, Any], event: dict[str, Any]) -> None:
+    job["stage"] = event.get("stage", "engine")
+    raw_progress = event.get("progress")
+    if isinstance(raw_progress, (int, float)):
+        # Reserve the final 5% for publishing and validation. This keeps a
+        # late engine event at 99% from being followed by a visible 90% drop.
+        mapped = round(min(95.0, max(0.0, float(raw_progress) * 0.95)), 2)
+        previous = job.get("progress")
+        job["progress"] = max(float(previous), mapped) if isinstance(previous, (int, float)) else mapped
+        job["progress_indeterminate"] = False
+    else:
+        job["progress"] = None
+        job["progress_indeterminate"] = True
+    if "stage_current" in event:
+        job["stage_current"] = event["stage_current"]
+    if "stage_total" in event:
+        job["stage_total"] = event["stage_total"]
+
+
+def _write_translation_meta(job: dict[str, Any], scope: str, translated: Path, bilingual: Path) -> None:
+    job_dir = JOBS / job["id"]
+    payload = {
+        "source_sha256": job["source_sha256"],
+        "scope": scope,
+        "translated_file": translated.relative_to(job_dir).as_posix(),
+        "bilingual_file": bilingual.relative_to(job_dir).as_posix(),
+        "translated_sha256": _sha256(translated),
+        "bilingual_sha256": _sha256(bilingual),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    temporary = _translation_meta_path(job).with_name(f".translation-meta.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, _translation_meta_path(job))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _manifest_outputs_match(meta: dict[str, Any], job: dict[str, Any], scope: str, translated: Path, bilingual: Path) -> bool:
+    """Allow replacement only for an intact output owned by this manifest."""
+    job_dir = JOBS / job["id"]
+    try:
+        translated_rel = translated.relative_to(job_dir).as_posix()
+        bilingual_rel = bilingual.relative_to(job_dir).as_posix()
+    except ValueError:
+        return False
+    return (
+        meta.get("translated_file") == translated_rel
+        and meta.get("bilingual_file") == bilingual_rel
+        and meta.get("source_sha256") == job.get("source_sha256")
+        and meta.get("scope") == scope
+        and translated.is_file()
+        and bilingual.is_file()
+        and meta.get("translated_sha256") == _sha256(translated)
+        and meta.get("bilingual_sha256") == _sha256(bilingual)
+    )
+
+
+def _translation_output_paths(job: dict[str, Any], scope: str) -> tuple[Path, Path]:
+    """Choose stable names while preserving unknown or edited PDFs."""
+    job_dir = JOBS / job["id"]
+    stem = Path(job["filename"]).stem
+    target_dir = job_dir / "translate" if scope == "full" else job_dir / ("trial" if scope == "trial" else "demo")
+    translated_name = f"{stem}.zh.pdf" if scope == "full" else f"{stem}.{scope}.zh.pdf"
+    bilingual_name = f"{stem}.zh.bilingual.pdf" if scope == "full" else f"{stem}.{scope}.bilingual.pdf"
+    canonical = (target_dir / translated_name, target_dir / bilingual_name)
+    meta = _read_translation_meta(job)
+    if not canonical[0].exists() and not canonical[1].exists():
+        return canonical
+    if _manifest_outputs_match(meta, job, scope, *canonical):
+        return canonical
+    suffix = (job.get("source_sha256") or _sha256(job_dir / "source.pdf"))[:12]
+    for index in range(1000):
+        tag = suffix if index == 0 else f"{suffix}-{index + 1}"
+        candidate = (target_dir / f"{stem}.{tag}.zh.pdf", target_dir / f"{stem}.{tag}.zh.bilingual.pdf")
+        if not candidate[0].exists() and not candidate[1].exists():
+            return candidate
+        if _manifest_outputs_match(meta, job, scope, *candidate):
+            return candidate
+    raise RuntimeError("译文输出目录中已有过多同名文件，无法安全生成新译文。")
+
+
+def _publish_translation_outputs(job: dict[str, Any], generated_translated: Path, generated_bilingual: Path, scope: str | None = None) -> tuple[Path, Path]:
+    job_dir = JOBS / job["id"]
+    scope = scope or ("full" if job.get("mode") == "full" else "trial")
+    translated, bilingual = _translation_output_paths(job, scope)
+    _atomic_copy(generated_translated, translated)
+    _atomic_copy(generated_bilingual if generated_bilingual.is_file() else generated_translated, bilingual)
+    _write_translation_meta(job, scope, translated, bilingual)
+    return translated, bilingual
+
+
+def _find_cached_full_translation(source_sha256: str, exclude_job_id: str | None = None) -> tuple[Path, Path] | None:
+    if not JOBS.is_dir():
+        return None
+    for meta_path in JOBS.glob("*/translation-meta.json"):
+        job_id = meta_path.parent.name
+        if exclude_job_id and job_id == exclude_job_id:
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(meta, dict) or meta.get("scope") != "full" or meta.get("source_sha256") != source_sha256:
+            continue
+        job = {"id": job_id}
+        translated = _job_relative_file(job, meta.get("translated_file"))
+        bilingual = _job_relative_file(job, meta.get("bilingual_file")) or translated
+        if translated and meta.get("translated_sha256") == _sha256(translated) and bilingual and meta.get("bilingual_sha256") == _sha256(bilingual):
+            return translated, bilingual or translated
+    return None
+
+
+def _reuse_full_translation(job: dict[str, Any]) -> bool:
+    source = JOBS / job["id"] / "source.pdf"
+    if not source.is_file():
+        return False
+    source_sha256 = _sha256(source)
+    job["source_sha256"] = source_sha256
+    meta = _read_translation_meta(job)
+    existing_translated = _job_relative_file(job, meta.get("translated_file")) if meta.get("source_sha256") == source_sha256 and meta.get("scope") == "full" else None
+    existing_bilingual = _job_relative_file(job, meta.get("bilingual_file")) if existing_translated else None
+    if existing_translated and (not existing_bilingual or meta.get("translated_sha256") != _sha256(existing_translated) or meta.get("bilingual_sha256") != _sha256(existing_bilingual)):
+        existing_translated = None
+        existing_bilingual = None
+    cached = (existing_translated, existing_bilingual or existing_translated) if existing_translated else _find_cached_full_translation(source_sha256, job["id"])
+    if not cached:
+        return False
+    translated, bilingual = _translation_output_paths(job, "full")
+    _atomic_copy(cached[0], translated)
+    _atomic_copy(cached[1], bilingual)
+    _write_translation_meta(job, "full", translated, bilingual)
+    job.update({"translated_file": translated.relative_to(JOBS / job["id"]).as_posix(), "bilingual_file": bilingual.relative_to(JOBS / job["id"]).as_posix(), "translation_scope": "full", "translation_reused": True, "message": "已复用同源全文译文，未再次调用 API。"})
+    return True
+
+
+def _external_member_path(directory: Path, relative: Any) -> Path | None:
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        return None
+    candidate = (directory / relative).resolve()
+    try:
+        candidate.relative_to(directory.resolve())
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _external_manifest_path(directory: Path, stem: str, suffix: str = "") -> Path:
+    return directory / f"{stem}{suffix}.zh.manifest.json"
+
+
+def _read_external_manifest(source: Path, source_sha256: str) -> tuple[Path, Path] | None:
+    directory = source.parent / "translate"
+    if not directory.is_dir():
+        return None
+    stem = source.stem
+    manifests = [_external_manifest_path(directory, stem)]
+    manifests.extend(sorted(directory.glob(f"{stem}.*.zh.manifest.json")))
+    seen: set[Path] = set()
+    for manifest_path in manifests:
+        manifest_path = manifest_path.resolve()
+        if manifest_path in seen:
+            continue
+        seen.add(manifest_path)
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("scope") != "full" or payload.get("source_sha256") != source_sha256:
+            continue
+        translated = _external_member_path(directory, payload.get("translated_file"))
+        bilingual = _external_member_path(directory, payload.get("bilingual_file"))
+        if (
+            translated
+            and bilingual
+            and payload.get("translated_sha256") == _sha256(translated)
+            and payload.get("bilingual_sha256") == _sha256(bilingual)
+        ):
+            return translated, bilingual
+    return None
+
+
+def _external_manifest_matches(manifest_path: Path, source: Path, source_sha256: str, translated: Path, bilingual: Path) -> bool:
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    directory = source.parent / "translate"
+    return (
+        isinstance(payload, dict)
+        and payload.get("scope") == "full"
+        and payload.get("source_sha256") == source_sha256
+        and payload.get("translated_file") == translated.name
+        and payload.get("bilingual_file") == bilingual.name
+        and payload.get("translated_sha256") == _sha256(translated)
+        and payload.get("bilingual_sha256") == _sha256(bilingual)
+        and manifest_path.parent.resolve() == directory.resolve()
+    )
+
+
+def _external_output_paths(source: Path, source_sha256: str) -> tuple[Path, Path, Path]:
+    directory = source.parent / "translate"
+    stem = source.stem
+    canonical = (directory / f"{stem}.zh.pdf", directory / f"{stem}.zh.bilingual.pdf", _external_manifest_path(directory, stem))
+    if not any(path.exists() for path in canonical):
+        return canonical
+    if all(path.is_file() for path in canonical) and _external_manifest_matches(canonical[2], source, source_sha256, canonical[0], canonical[1]):
+        return canonical
+    suffix = source_sha256[:12]
+    for index in range(1000):
+        tag = suffix if index == 0 else f"{suffix}-{index + 1}"
+        candidate = (
+            directory / f"{stem}.{tag}.zh.pdf",
+            directory / f"{stem}.{tag}.zh.bilingual.pdf",
+            _external_manifest_path(directory, stem, f".{tag}"),
+        )
+        if not any(path.exists() for path in candidate):
+            return candidate
+        if all(path.is_file() for path in candidate) and _external_manifest_matches(candidate[2], source, source_sha256, candidate[0], candidate[1]):
+            return candidate
+    raise RuntimeError("原文目录中已有过多同名译文，无法安全写入旁边目录。")
+
+
+def _write_external_manifest(path: Path, source: Path, source_sha256: str, translated: Path, bilingual: Path) -> None:
+    payload = {
+        "schema": 1,
+        "scope": "full",
+        "source_name": source.name,
+        "source_sha256": source_sha256,
+        "translated_file": translated.name,
+        "bilingual_file": bilingual.name,
+        "translated_sha256": _sha256(translated),
+        "bilingual_sha256": _sha256(bilingual),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _publish_external_full_outputs(job: dict[str, Any], translated: Path, bilingual: Path) -> str | None:
+    source = _read_external_source(job)
+    if not source:
+        return None
+    expected_sha256 = job.get("source_sha256")
+    try:
+        if not expected_sha256 or _sha256(source) != expected_sha256:
+            return "原始文件在翻译期间已变化，未覆盖其旁边目录；job 内译文已保留。"
+        target_translated, target_bilingual, manifest = _external_output_paths(source, expected_sha256)
+        target_translated.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_copy(translated, target_translated)
+        _atomic_copy(bilingual, target_bilingual)
+        _write_external_manifest(manifest, source, expected_sha256, target_translated, target_bilingual)
+        return None
+    except (OSError, RuntimeError) as exc:
+        return f"原文目录不可写，未保存旁边译文；job 内译文已保留（{exc}）。"
+
+
+def _reuse_external_translation(job: dict[str, Any], source: Path) -> bool:
+    source_sha256 = _sha256(source)
+    cached = _read_external_manifest(source, source_sha256)
+    if not cached:
+        return False
+    translated, bilingual = _translation_output_paths(job, "full")
+    _atomic_copy(cached[0], translated)
+    _atomic_copy(cached[1], bilingual)
+    job["source_sha256"] = source_sha256
+    _write_translation_meta(job, "full", translated, bilingual)
+    job.update({
+        "status": "completed",
+        "progress": 100,
+        "progress_indeterminate": False,
+        "stage": "reused",
+        "translated_file": translated.relative_to(JOBS / job["id"]).as_posix(),
+        "bilingual_file": bilingual.relative_to(JOBS / job["id"]).as_posix(),
+        "translation_scope": "full",
+        "translation_reused": True,
+        "error": "",
+        "message": "已复用原文目录旁边的同源全文译文，未再次调用 API。",
+    })
+    return True
 
 
 def parse_pages(value: str, page_count: int) -> str:
@@ -208,7 +606,7 @@ def _run_babeldoc(job: dict[str, Any], settings: dict[str, Any]) -> tuple[Path, 
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".toml", prefix="paper-translator-", delete=False) as config_file:
             config_file.write(config_text)
             config_path = Path(config_file.name)
-        args = command + ["--files", str(source), "--config", str(config_path)]
+        args = command + ["--files", str(source), "--config", str(config_path), "--debug"]
         if urlparse(settings["base_url"]).hostname == "api.deepseek.com":
             # DeepSeek V4 defaults to thinking mode. Its reasoning can consume
             # the response budget before BabelDOC receives usable text/JSON.
@@ -217,15 +615,46 @@ def _run_babeldoc(job: dict[str, Any], settings: dict[str, Any]) -> tuple[Path, 
             args += ["--pages", job["pages"]]
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
-        completed = subprocess.run(args, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60 * 60, env=env)
+        process = subprocess.Popen(args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, env=env)
+        lines: queue.Queue[str | None] = queue.Queue()
+
+        def read_engine_output() -> None:
+            assert process.stdout is not None
+            for output_line in process.stdout:
+                lines.put(output_line)
+            lines.put(None)
+
+        reader = threading.Thread(target=read_engine_output, daemon=True)
+        reader.start()
+        engine_log = job_dir / "engine.log"
+        last_save = 0.0
+        eof = False
+        while not eof or process.poll() is None:
+            try:
+                output_line = lines.get(timeout=0.25)
+            except queue.Empty:
+                output_line = ""
+            if output_line is None:
+                eof = True
+                continue
+            if not output_line:
+                continue
+            with engine_log.open("a", encoding="utf-8") as log_stream:
+                log_stream.write(_redact_engine_line(output_line, settings.get("api_key", "")))
+            event = parse_engine_progress(output_line)
+            if event:
+                _apply_progress_event(job, event)
+                now = time.monotonic()
+                if now - last_save >= 0.25:
+                    save_job(job)
+                    last_save = now
+        process.wait(timeout=30)
+        reader.join(timeout=2)
+        completed = process
     finally:
         if config_path:
             config_path.unlink(missing_ok=True)
-    diagnostic = (completed.stdout or "") + "\n" + (completed.stderr or "")
-    if settings.get("api_key"):
-        diagnostic = diagnostic.replace(settings["api_key"], "[REDACTED]")
-    diagnostic = re.sub(r"sk-[A-Za-z0-9_-]+", "[REDACTED]", diagnostic)
-    (job_dir / "engine.log").write_text(diagnostic, encoding="utf-8")
+    diagnostic = (job_dir / "engine.log").read_text(encoding="utf-8") if (job_dir / "engine.log").exists() else ""
     details = diagnostic.strip()[-1200:] or "BabelDOC 未返回错误详情"
     if completed.returncode != 0:
         raise RuntimeError(f"BabelDOC 翻译失败：{details}")
@@ -236,13 +665,7 @@ def _run_babeldoc(job: dict[str, Any], settings: dict[str, Any]) -> tuple[Path, 
     translated = next((p for p in pdfs if any(s in p.name.lower() for s in ("mono", "translate", "translated", "译"))), None)
     bilingual = bilingual or pdfs[0]
     translated = translated or pdfs[-1]
-    # file_path() serves files from the job root, while BabelDOC writes into
-    # its output directory. Publish both PDFs there before completing the job.
-    published_translated = job_dir / translated.name
-    published_bilingual = job_dir / bilingual.name
-    shutil.copy2(translated, published_translated)
-    if bilingual != translated:
-        shutil.copy2(bilingual, published_bilingual)
+    published_translated, published_bilingual = _publish_translation_outputs(job, translated, bilingual)
     _validate_translation_output(source, published_translated, job)
     return published_translated, published_bilingual
 
@@ -345,37 +768,68 @@ def _run_demo(job: dict[str, Any]) -> tuple[Path, Path]:
     # It is never presented as a translation, and keeps local UI/preview tests
     # usable without a real API key or a network call.
     source = JOBS / job["id"] / "source.pdf"
-    translated = JOBS / job["id"] / "translated-demo.pdf"
-    bilingual = JOBS / job["id"] / "bilingual-demo.pdf"
+    translated = JOBS / job["id"] / "demo-generated-translated.pdf"
+    bilingual = JOBS / job["id"] / "demo-generated-bilingual.pdf"
     shutil.copyfile(source, translated)
     shutil.copyfile(source, bilingual)
-    return translated, bilingual
+    return _publish_translation_outputs(job, translated, bilingual, scope="demo")
 
 
 def _worker(job: dict[str, Any]) -> None:
     engine_started = False
     try:
         job["status"] = "running"
-        job["progress"] = 8
+        job["progress"] = None
+        job["progress_indeterminate"] = True
+        job["stage"] = "preparing"
+        job["stage_current"] = 0
+        job["stage_total"] = None
         save_job(job)
+        source = JOBS / job["id"] / "source.pdf"
+        if source.is_file():
+            # Recompute on every run, including trial/demo runs, so a source
+            # edited in place cannot retain the previous manifest hash.
+            job["source_sha256"] = _sha256(source)
+            save_job(job)
+        if job.get("mode") == "full" and not job.get("demo_mode") and _reuse_full_translation(job):
+            translated = JOBS / job["id"] / job["translated_file"]
+            bilingual = JOBS / job["id"] / job["bilingual_file"]
+            warning = _publish_external_full_outputs(job, translated, bilingual)
+            if warning:
+                job["message"] = f"{job.get('message', '翻译完成。')} {warning}"
+            job.update({"status": "completed", "progress": 100, "progress_indeterminate": False, "stage": "reused", "message": "已复用同源全文译文，未再次调用 API。", "error": ""})
+            if warning:
+                job["message"] = f"已复用同源全文译文，未再次调用 API。{warning}"
+            save_job(job)
+            return
         settings = read_settings()
         if job["demo_mode"]:
             translated, bilingual = _run_demo(job)
+            job.update({"progress": max(float(job.get("progress") or 0), 95.0), "progress_indeterminate": False, "stage": "publishing"})
         else:
             if not settings["api_key"]:
                 raise RuntimeError("尚未设置 API Key。请先在设置页保存密钥，或勾选“无 Key 演示模式”验证上传与阅读流程。")
-            job["progress"] = 15
+            job["stage"] = "engine"
             save_job(job)
             engine_started = True
             translated, bilingual = _run_babeldoc(job, settings)
-        job["translated_file"] = translated.name
-        job["bilingual_file"] = bilingual.name
+        external_warning = _publish_external_full_outputs(job, translated, bilingual) if job.get("mode") == "full" and not job.get("demo_mode") else None
+        job["translated_file"] = translated.relative_to(JOBS / job["id"]).as_posix()
+        job["bilingual_file"] = bilingual.relative_to(JOBS / job["id"]).as_posix()
+        job["translation_scope"] = "demo" if job.get("demo_mode") else ("full" if job.get("mode") == "full" else "trial")
+        job["translation_reused"] = False
         job["status"] = "completed"
         job["progress"] = 100
-        job["message"] = "演示模式：PDF 已保留用于阅读流程验证，未执行真实翻译。" if job["demo_mode"] else "翻译完成。"
+        job["progress_indeterminate"] = False
+        job["stage"] = "completed"
+        job["message"] = "演示模式：PDF 已保留用于阅读流程验证，未执行真实翻译；这是试译流程占位结果。" if job["demo_mode"] else ("试译完成：该译文仅覆盖所选页码，不会作为全文译文自动加载。" if job.get("mode") == "trial" else "翻译完成。")
+        if external_warning:
+            job["message"] += f" {external_warning}"
     except Exception as exc:
         job["status"] = "failed"
-        job["progress"] = 100
+        job["progress"] = None
+        job["progress_indeterminate"] = True
+        job["stage"] = "failed"
         job["error"] = str(exc)
     if engine_started:
         _record_engine_usage(job)
@@ -405,11 +859,51 @@ def create_job(filename: str, content: bytes, pages: str, mode: str, demo_mode: 
         shutil.rmtree(job_dir, ignore_errors=True)
         raise ValueError("无法读取 PDF 页数，请确认文件未损坏且未加密。")
     actual_mode = mode if mode in {"trial", "full"} else "full"
-    job = {"id": job_id, "filename": safe_filename(filename), "created_at": datetime.now(timezone.utc).isoformat(), "status": "queued" if start_translation else "imported", "progress": 0, "mode": actual_mode, "pages": pages, "page_count": page_count, "demo_mode": bool(demo_mode), "error": "", "message": "已导入源 PDF，可先预览或开始翻译。" if not start_translation else ""}
+    job = {"id": job_id, "filename": safe_filename(filename), "created_at": datetime.now(timezone.utc).isoformat(), "status": "queued" if start_translation else "imported", "progress": None, "progress_indeterminate": True, "stage": "queued" if start_translation else "imported", "stage_current": 0, "stage_total": None, "mode": actual_mode, "pages": pages, "page_count": page_count, "demo_mode": bool(demo_mode), "source_sha256": _sha256(source), "translation_scope": None, "translation_reused": False, "error": "", "message": "已导入源 PDF，可先预览或开始翻译。" if not start_translation else ""}
     save_job(job)
     if start_translation:
         _start_job(job)
     return job
+
+
+def create_job_from_path(path_value: str, pages: str, mode: str, demo_mode: bool, start_translation: bool = False) -> dict[str, Any]:
+    if not isinstance(path_value, str) or not path_value.strip():
+        raise ValueError("本地 PDF 路径不能为空。")
+    candidate = Path(path_value).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("本地 PDF 路径必须是绝对路径。")
+    try:
+        candidate = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ValueError("本地 PDF 不存在。") from exc
+    if not candidate.is_file() or candidate.suffix.lower() != ".pdf":
+        raise ValueError("本地文件必须是 PDF。")
+    if candidate.stat().st_size > MAX_LOCAL_IMPORT_BYTES:
+        raise ValueError("文件超过 100 MB 限制，请压缩后再试。")
+    # Keep native imports stopped until the sidecar/cache decision is made;
+    # otherwise create_job would start a worker before we can inspect it.
+    job = create_job(candidate.name, candidate.read_bytes(), pages, mode, demo_mode, start_translation=False)
+    job["source_origin"] = "desktop-local"
+    save_job(job)
+    try:
+        _write_external_source(job, candidate)
+    except OSError:
+        job["message"] = "已导入源 PDF，但无法记录原文件位置；翻译结果仍会保存在 job 目录。"
+    if job.get("mode") == "full" and not demo_mode and _reuse_external_translation(job, candidate):
+        save_job(job)
+        return job
+    if start_translation:
+        job["status"] = "queued"
+        job["stage"] = "queued"
+        job["message"] = ""
+        save_job(job)
+        _start_job(job)
+    return job
+
+
+def import_job_from_path(path_value: str, mode: str = "full", pages: str = "", demo_mode: bool = False, start_translation: bool = False) -> dict[str, Any]:
+    """Native desktop bridge entry point; the picker supplies the path."""
+    return create_job_from_path(path_value, pages, mode, demo_mode, start_translation=start_translation)
 
 
 def translate_job(job_id: str, mode: str, pages: str, demo_mode: bool) -> dict[str, Any]:
@@ -420,7 +914,7 @@ def translate_job(job_id: str, mode: str, pages: str, demo_mode: bool) -> dict[s
         raise ValueError("任务正在处理中，请等待当前任务完成。")
     mode = mode if mode in {"trial", "full"} else "full"
     pages = parse_pages(pages if mode == "trial" else "", int(job["page_count"]))
-    job.update({"status": "queued", "progress": 0, "mode": mode, "pages": pages, "demo_mode": bool(demo_mode), "error": "", "message": ""})
+    job.update({"status": "queued", "progress": None, "progress_indeterminate": True, "stage": "queued", "stage_current": 0, "stage_total": None, "mode": mode, "pages": pages, "demo_mode": bool(demo_mode), "translation_scope": None, "translation_reused": False, "error": "", "message": ""})
     save_job(job)
     _start_job(job)
     return job
@@ -438,6 +932,8 @@ def file_path(job_id: str, kind: str) -> Path | None:
     try:
         candidate.relative_to((JOBS / job_id).resolve())
     except ValueError:
+        return None
+    if kind in {"translated", "bilingual"} and not _translation_is_current(job):
         return None
     return candidate if candidate.is_file() else None
 

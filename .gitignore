@@ -32,5 +32,11 @@ dist/
 build/
 .coverage
 htmlcov/
+packaging/.venv/
+packaging/cache/
+packaging/tools/
+packaging/stage/
+packaging/output/
+*.exe
 .DS_Store
 Thumbs.db

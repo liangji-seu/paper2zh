@@ -21,7 +21,7 @@ from .annotations import (
     export_annotated,
     get_annotations,
 )
-from .core import DATA, JOBS, MAX_UPLOAD_BYTES, create_job, file_path, list_jobs, load_job, public_settings, read_settings, render_page, save_settings, translate_job
+from .core import DATA, JOBS, MAX_UPLOAD_BYTES, create_job, create_job_from_path, file_path, list_jobs, load_job, public_settings, read_settings, render_page, save_settings, translate_job
 from .library import MAX_LIBRARY_BODY_BYTES, apply_action, get_library
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -207,8 +207,23 @@ class Handler(BaseHTTPRequestHandler):
             self._check_local_write(request_content_type)
             route_parts = [x for x in path.split("/") if x]
             annotation_route = len(route_parts) == 5 and route_parts[:2] == ["api", "jobs"] and route_parts[3] in {"source", "translated"} and route_parts[4] == "annotations"
-            body_limit = MAX_ANNOTATION_BODY_BYTES if annotation_route else MAX_LIBRARY_BODY_BYTES if path == "/api/library" else None
+            local_import_route = path == "/api/jobs/import-local"
+            body_limit = MAX_ANNOTATION_BODY_BYTES if annotation_route else MAX_LIBRARY_BODY_BYTES if path == "/api/library" else 64 * 1024 if local_import_route else None
             body = self._read_body(body_limit)
+            if local_import_route:
+                if self.headers.get("X-Paper-Translator-Desktop") != "1":
+                    raise ValueError("本地路径导入只接受桌面原生文件选择桥。")
+                origin = self.headers.get("Origin")
+                if origin not in {None, "", "null"}:
+                    raise ValueError("本地路径导入不能由网页 Origin 调用。")
+                if request_content_type.split(";", 1)[0].strip().lower() != "application/json":
+                    raise ValueError("本地路径导入必须使用 application/json。")
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                if not isinstance(payload, dict):
+                    raise ValueError("本地导入参数格式无效。")
+                job = create_job_from_path(str(payload.get("path", "")), str(payload.get("pages", "")), str(payload.get("mode", "full")), bool(payload.get("demo_mode", False)), start_translation=False)
+                self._json(202, {"job": job})
+                return
             if path == "/api/library":
                 if request_content_type.split(";", 1)[0].strip().lower() != "application/json":
                     raise ValueError("文件库操作必须使用 application/json。")
