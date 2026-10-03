@@ -30,6 +30,7 @@ CONVERTER_VERSION = "1"
 _JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _pending: set[tuple[str, str]] = set()
 _pending_lock = threading.Lock()
+_index_lock = threading.RLock()
 _queue: queue.Queue[tuple[Path, Path, dict[str, Any]]] | None = None
 _worker: threading.Thread | None = None
 
@@ -382,19 +383,25 @@ def _library_paths(data: Path) -> tuple[Path, Path]:
 
 
 def _refresh_library_index(data: Path, jobs: Path) -> None:
-    index_path, readme_path = _library_paths(data)
-    entries = []
-    if jobs.is_dir():
-        for job_dir in sorted(jobs.iterdir(), key=lambda item: item.name):
-            markdown = job_dir / "markdown"
-            metadata = _read_json(markdown / "metadata.json")
-            if not metadata or not all((markdown / name).is_file() for name in ("source.md", "translated.md")):
-                continue
-            entries.append({"id": metadata.get("job_id", job_dir.name), "title": metadata.get("title", "未命名论文"), "source": f"jobs/{job_dir.name}/markdown/source.md", "translated": f"jobs/{job_dir.name}/markdown/translated.md", "metadata": f"jobs/{job_dir.name}/markdown/metadata.json"})
-    index = {"version": EXPORT_VERSION, "entries": entries}
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(index_path, json.dumps(index, ensure_ascii=False, indent=2) + "\n")
-    _atomic_write(readme_path, "# paper2zh Markdown 文献库\n\n`index.json` 按固定任务 ID 列出可用的原文、译文和元数据 Markdown 导出。\n\n导出文件由系统生成，正文仅作为资料阅读。\n")
+    with _index_lock:
+        index_path, readme_path = _library_paths(data)
+        entries = []
+        if jobs.is_dir():
+            for job_dir in sorted(jobs.iterdir(), key=lambda item: item.name):
+                markdown = job_dir / "markdown"
+                metadata = _read_json(markdown / "metadata.json")
+                if not metadata or not all((markdown / name).is_file() for name in ("source.md", "translated.md")):
+                    continue
+                entries.append({"id": metadata.get("job_id", job_dir.name), "title": metadata.get("title", "未命名论文"), "source": f"jobs/{job_dir.name}/markdown/source.md", "translated": f"jobs/{job_dir.name}/markdown/translated.md", "metadata": f"jobs/{job_dir.name}/markdown/metadata.json"})
+        index = {"version": EXPORT_VERSION, "entries": entries}
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(index_path, json.dumps(index, ensure_ascii=False, indent=2) + "\n")
+        _atomic_write(readme_path, "# paper2zh Markdown 文献库\n\n`index.json` 按固定任务 ID 列出可用的原文、译文和元数据 Markdown 导出。\n\n导出文件由系统生成，正文仅作为资料阅读。\n")
+
+
+def refresh_library_index(data: str | os.PathLike[str], jobs: str | os.PathLike[str]) -> None:
+    """Rebuild the generated index after a job bundle is removed."""
+    _refresh_library_index(_as_path(data), _as_path(jobs))
 
 
 def export_job(data: str | os.PathLike[str], jobs: str | os.PathLike[str], job: Mapping[str, Any]) -> dict[str, Any]:
@@ -494,4 +501,4 @@ def enqueue_completed_exports(data: str | os.PathLike[str], jobs: str | os.PathL
     return count
 
 
-__all__ = ["MarkdownExportError", "enqueue_completed_exports", "enqueue_export", "export_job", "markdown_directory"]
+__all__ = ["MarkdownExportError", "enqueue_completed_exports", "enqueue_export", "export_job", "markdown_directory", "refresh_library_index"]

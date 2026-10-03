@@ -93,7 +93,7 @@ def _check_parent(folder_id: str | None, parent_id: str | None, folders: dict[st
 
 
 def _check_job(job_id: Any) -> str:
-    if not isinstance(job_id, str) or not job_id.strip():
+    if not isinstance(job_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job_id):
         raise ValueError("job_id 无效。")
     candidate = (core.JOBS / job_id).resolve()
     try:
@@ -144,7 +144,23 @@ def apply_action(payload: dict[str, Any]) -> dict[str, Any]:
             if folder_id is not None and folder_id not in folders:
                 raise ValueError("目标文件夹不存在。")
             state["documents"][job_id] = folder_id
+        elif action == "delete_document":
+            job_id = _check_job(payload.get("job_id"))
+            previous = json.loads(json.dumps(state, ensure_ascii=False))
+            state["documents"].pop(job_id, None)
+            # Publish the association change first. If the owned bundle
+            # deletion is refused, restore the previous library mapping.
+            _write(state)
+            try:
+                core.delete_job(job_id)
+            except Exception:
+                try:
+                    _write(previous)
+                except Exception as restore_exc:
+                    raise OSError(f"删除失败，且无法恢复文献库关联：{restore_exc}")
+                raise
+            return get_library()
         else:
-            raise ValueError("action 必须是 create_folder、rename_folder、move_folder 或 move_document。")
+            raise ValueError("action 必须是 create_folder、rename_folder、move_folder、delete_document。")
         _write(state)
         return get_library()

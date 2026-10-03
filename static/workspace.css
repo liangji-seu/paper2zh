@@ -26,6 +26,7 @@ html,body{height:100%;overflow:hidden}.app{height:100dvh;min-height:0;overflow:h
 .progress-wrap{padding:3px 12px 4px}.progress-copy{margin-bottom:3px;font-size:10px;line-height:13px}.progress-track{height:3px}
 @media (min-width:721px) and (max-width:900px){.annotate-controls{width:auto;margin:0 0 0 4px}.tools{gap:4px}.tabs button{padding-left:6px;padding-right:6px}.controls button{padding-left:5px;padding-right:5px}}
 .scroll{cursor:text}.scroll.space-pan{cursor:grab}.scroll.space-pan.is-panning{cursor:grabbing}
+.actions .danger{background:#b74745;color:#fff;border-color:#b74745}.actions .danger:hover{background:#9f3938;border-color:#9f3938}
 
 /* Light desktop reading workspace. Keep the reader geometry above intact. */
 :root{

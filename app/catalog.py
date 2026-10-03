@@ -126,8 +126,38 @@ def remove(data: Path, job_id: str) -> None:
     with _lock:
         connection = _connect(data)
         try:
+            hashes = [str(row[0]) for row in connection.execute(
+                "SELECT DISTINCT source_sha256 FROM documents WHERE job_id = ?",
+                (job_id,),
+            ).fetchall()]
             connection.execute("DELETE FROM source_index WHERE job_id = ?", (job_id,))
             connection.execute("DELETE FROM documents WHERE job_id = ?", (job_id,))
+            # Restore duplicate-source mapping when another legacy job with
+            # the same bytes remains in the catalog.
+            for source_hash in hashes:
+                candidates = connection.execute(
+                    "SELECT job_id, status, translated_pdf FROM documents WHERE source_sha256 = ? ORDER BY created_at ASC",
+                    (source_hash,),
+                ).fetchall()
+                preferred = None
+                for candidate in candidates:
+                    candidate_dir = data / "jobs" / str(candidate["job_id"])
+                    translated = candidate["translated_pdf"]
+                    if (candidate["status"] == "completed" and isinstance(translated, str)
+                            and (candidate_dir / translated).is_file()
+                            and (candidate_dir / "job.json").is_file()):
+                        preferred = candidate["job_id"]
+                        break
+                if preferred is None:
+                    for candidate in candidates:
+                        if (data / "jobs" / str(candidate["job_id"]) / "job.json").is_file():
+                            preferred = candidate["job_id"]
+                            break
+                if preferred is not None:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO source_index(source_sha256, job_id) VALUES (?, ?)",
+                        (source_hash, str(preferred)),
+                    )
             connection.commit()
         finally:
             connection.close()

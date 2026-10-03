@@ -7,6 +7,7 @@ import os
 import queue
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -60,6 +61,8 @@ _catalog_synced: set[str] = set()
 _migration_lock = threading.RLock()
 _sha_cache: dict[tuple[str, int, int, int], str] = {}
 _markdown_scheduled: set[str] = set()
+_active_jobs: set[str] = set()
+_deleted_jobs: set[str] = set()
 
 
 def ensure_dirs() -> None:
@@ -696,23 +699,34 @@ def parse_pages(value: str, page_count: int) -> str:
 
 def load_job(job_id: str) -> dict[str, Any] | None:
     with _lock:
+        if job_id in _deleted_jobs:
+            return None
         if job_id in _jobs:
             result = dict(_jobs[job_id])
             if result.get("status") == "completed" and _fill_translation_title(result):
                 save_job(result)
             return result
-    path = JOBS / job_id / "job.json"
-    try:
-        result = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(result, dict) and result.get("status") == "completed" and _fill_translation_title(result):
-            save_job(result)
-        return result
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
+        path = JOBS / job_id / "job.json"
+        try:
+            result = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(result, dict) and result.get("status") == "completed" and _fill_translation_title(result):
+                save_job(result)
+            return result
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
 
 
-def save_job(job: dict[str, Any]) -> None:
+def _save_job_unlocked(job: dict[str, Any]) -> None:
     job_dir = JOBS / job["id"]
+    if not isinstance(job.get("id"), str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job["id"]):
+        raise ValueError("job_id 无效。")
+    candidate = Path(os.path.abspath(JOBS / job["id"]))
+    try:
+        candidate.relative_to(Path(os.path.abspath(JOBS)))
+    except ValueError as exc:
+        raise ValueError("文献任务路径不安全。") from exc
+    if job["id"] in _deleted_jobs:
+        raise FileNotFoundError("文献任务已删除，拒绝写回旧任务。")
     job_dir.mkdir(parents=True, exist_ok=True)
     destination = job_dir / "job.json"
     temporary = job_dir / f".job.{uuid.uuid4().hex}.tmp"
@@ -732,6 +746,11 @@ def save_job(job: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
     with _lock:
         _jobs[job["id"]] = dict(job)
+
+
+def save_job(job: dict[str, Any]) -> None:
+    with _lock:
+        _save_job_unlocked(job)
 
 
 def list_jobs() -> list[dict[str, Any]]:
@@ -1084,7 +1103,16 @@ def _worker(job: dict[str, Any]) -> None:
 
 
 def _start_job(job: dict[str, Any]) -> None:
-    thread = threading.Thread(target=_worker, args=(job,), daemon=True)
+    job_id = str(job.get("id", ""))
+    with _lock:
+        _active_jobs.add(job_id)
+    def run() -> None:
+        try:
+            _worker(job)
+        finally:
+            with _lock:
+                _active_jobs.discard(job_id)
+    thread = threading.Thread(target=run, daemon=True)
     thread.start()
 
 
@@ -1108,7 +1136,8 @@ def _enqueue_markdown_export(job: dict[str, Any]) -> None:
             try:
                 current = json.loads(current_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
-                current = dict(job)
+                # A deleted job must never be resurrected by this stale timer.
+                return
             enqueue_export(data_root, jobs_root, current)
         except Exception:
             # Markdown is an auxiliary export; PDF completion remains successful.
@@ -1169,7 +1198,133 @@ def _markdown_export_current(job: dict[str, Any]) -> bool:
     )
 
 
-def create_job(filename: str, content: bytes, pages: str, mode: str, demo_mode: bool, start_translation: bool = True) -> dict[str, Any]:
+def _is_reparse_point(path: Path) -> bool:
+    """Return whether a path is a symlink or Windows reparse point."""
+    try:
+        if path.is_symlink():
+            return True
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _assert_owned_job_tree(job_dir: Path) -> None:
+    jobs_root = Path(os.path.abspath(JOBS))
+    if _is_reparse_point(JOBS) or _is_reparse_point(job_dir):
+        raise ValueError("文献任务目录包含符号链接或联接点，已拒绝删除。")
+    try:
+        resolved = Path(os.path.abspath(job_dir))
+        resolved.relative_to(jobs_root)
+    except (OSError, ValueError) as exc:
+        raise ValueError("文献任务路径不安全，已拒绝删除。") from exc
+    try:
+        descendants = list(job_dir.rglob("*"))
+    except OSError as exc:
+        raise ValueError("无法验证文献任务目录，已拒绝删除。") from exc
+    for path in descendants:
+        if _is_reparse_point(path):
+            raise ValueError("文献任务目录包含符号链接或联接点，已拒绝删除。")
+        try:
+            Path(os.path.abspath(path)).relative_to(jobs_root)
+        except (OSError, ValueError) as exc:
+            raise ValueError("文献任务路径不安全，已拒绝删除。") from exc
+
+
+def _markdown_job_key(job_id: str) -> str:
+    return f"{JOBS.resolve()}::{job_id}"
+
+
+def _delete_busy(job_id: str, job: dict[str, Any]) -> bool:
+    if str(job.get("status", "")) in {"queued", "running"} or job_id in _active_jobs:
+        return True
+    if _markdown_job_key(job_id) in _markdown_scheduled:
+        return True
+    try:
+        from . import markdown_export
+        with markdown_export._pending_lock:
+            return (str(JOBS.resolve()), job_id) in markdown_export._pending
+    except Exception:
+        # If queue state cannot be inspected, refuse deletion rather than
+        # risking a concurrent Markdown writer.
+        return True
+
+
+def delete_job(job_id: str) -> dict[str, Any]:
+    """Delete one software-owned job bundle and leave external files alone."""
+    if not isinstance(job_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job_id):
+        raise ValueError("job_id 无效。")
+    with _lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            try:
+                payload = json.loads((JOBS / job_id / "job.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                payload = None
+            job = payload if isinstance(payload, dict) else None
+        if not isinstance(job, dict) or str(job.get("id", "")) != job_id:
+            raise ValueError("文献任务不存在。")
+        if _delete_busy(job_id, job):
+            raise ValueError("文献正在处理中或 Markdown 导出尚未完成，请稍后再删除。")
+        job_dir = JOBS / job_id
+        _assert_owned_job_tree(job_dir)
+        staging_root = DATA / ".delete-staging"
+        if _is_reparse_point(staging_root):
+            raise ValueError("删除暂存目录包含符号链接或联接点，已拒绝删除。")
+        staging_root.mkdir(parents=True, exist_ok=True)
+        staging = staging_root / f"{job_id}.{uuid.uuid4().hex}"
+        from . import markdown_export
+        with markdown_export._index_lock:
+            index_snapshots: dict[Path, bytes | None] = {}
+            for index_path in (DATA / "index.json", DATA / "README.md"):
+                try:
+                    index_snapshots[index_path] = index_path.read_bytes()
+                except FileNotFoundError:
+                    index_snapshots[index_path] = None
+                except OSError as exc:
+                    raise OSError(f"无法读取 Markdown 索引，删除已取消：{exc}") from exc
+            try:
+                os.replace(job_dir, staging)
+            except OSError as exc:
+                raise OSError(f"文献库副本删除失败：{exc}") from exc
+            try:
+                catalog.remove(DATA, job_id)
+            except Exception as exc:
+                try:
+                    os.replace(staging, job_dir)
+                    catalog.update(DATA, job)
+                except Exception as restore_exc:
+                    raise OSError(f"文献库索引清理失败，且无法恢复文献库副本：{restore_exc}") from exc
+                raise OSError(f"文献库索引清理失败，删除已取消：{exc}") from exc
+            try:
+                markdown_export.refresh_library_index(DATA, JOBS)
+            except Exception as exc:
+                try:
+                    os.replace(staging, job_dir)
+                    catalog.update(DATA, job)
+                    for index_path, content in index_snapshots.items():
+                        if content is None:
+                            index_path.unlink(missing_ok=True)
+                        else:
+                            index_path.parent.mkdir(parents=True, exist_ok=True)
+                            index_path.write_bytes(content)
+                except Exception as restore_exc:
+                    raise OSError(f"Markdown 索引刷新失败，且无法恢复删除前状态：{restore_exc}") from exc
+                raise OSError(f"Markdown 索引刷新失败，删除已取消：{exc}") from exc
+        _jobs.pop(job_id, None)
+        try:
+            shutil.rmtree(staging)
+        except OSError as exc:
+            # The hidden staging copy is outside JOBS and is safe to clean up
+            # later; a successful index removal is still a completed delete.
+            print(f"[paper2zh] 删除残余暂存清理失败：{exc}")
+        _deleted_jobs.add(job_id)
+        return job
+
+
+def create_job(filename: str, content: bytes, pages: str, mode: str, demo_mode: bool, start_translation: bool = True, *, _track_lifecycle: bool = False) -> dict[str, Any]:
     if len(content) > MAX_UPLOAD_BYTES:
         raise ValueError("文件超过 100 MB 限制，请压缩后再试。")
     if not content.startswith(b"%PDF"):
@@ -1201,11 +1356,21 @@ def create_job(filename: str, content: bytes, pages: str, mode: str, demo_mode: 
             return duplicate
         raise ValueError("相同内容的文献索引指向尚未完成的导入，请稍后重试。")
     job_dir = JOBS / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
+    with _lock:
+        _active_jobs.add(job_id)
+    try:
+        job_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        with _lock:
+            _active_jobs.discard(job_id)
+        catalog.remove(DATA, job_id)
+        raise
     source = job_dir / "source.pdf"
     try:
         source.write_bytes(content)
     except OSError:
+        with _lock:
+            _active_jobs.discard(job_id)
         shutil.rmtree(job_dir, ignore_errors=True)
         catalog.remove(DATA, job_id)
         raise
@@ -1214,11 +1379,16 @@ def create_job(filename: str, content: bytes, pages: str, mode: str, demo_mode: 
     try:
         save_job(job)
     except Exception:
+        with _lock:
+            _active_jobs.discard(job_id)
         shutil.rmtree(job_dir, ignore_errors=True)
         catalog.remove(DATA, job_id)
         raise OSError(f"文献库目录不可写：{DATA}，导入未完成。")
     if start_translation:
         _start_job(job)
+    elif not _track_lifecycle:
+        with _lock:
+            _active_jobs.discard(job_id)
     return job
 
 
@@ -1238,26 +1408,33 @@ def create_job_from_path(path_value: str, pages: str, mode: str, demo_mode: bool
         raise ValueError("文件超过 100 MB 限制，请压缩后再试。")
     # Keep native imports stopped until the sidecar/cache decision is made;
     # otherwise create_job would start a worker before we can inspect it.
-    job = create_job(candidate.name, candidate.read_bytes(), pages, mode, demo_mode, start_translation=False)
+    job = create_job(candidate.name, candidate.read_bytes(), pages, mode, demo_mode, start_translation=False, _track_lifecycle=True)
     if job.get("duplicate"):
         return job
-    job["source_origin"] = "desktop-local"
-    save_job(job)
+    started = False
     try:
-        _write_external_source(job, candidate)
-    except OSError:
-        job["message"] = "已导入源 PDF，但无法记录原文件位置；翻译结果仍会保存在 job 目录。"
-    if job.get("mode") == "full" and not demo_mode and _reuse_external_translation(job, candidate):
+        job["source_origin"] = "desktop-local"
         save_job(job)
-        _enqueue_markdown_export(job)
+        try:
+            _write_external_source(job, candidate)
+        except OSError:
+            job["message"] = "已导入源 PDF，但无法记录原文件位置；翻译结果仍会保存在 job 目录。"
+        if job.get("mode") == "full" and not demo_mode and _reuse_external_translation(job, candidate):
+            save_job(job)
+            _enqueue_markdown_export(job)
+            return job
+        if start_translation:
+            job["status"] = "queued"
+            job["stage"] = "queued"
+            job["message"] = ""
+            save_job(job)
+            _start_job(job)
+            started = True
         return job
-    if start_translation:
-        job["status"] = "queued"
-        job["stage"] = "queued"
-        job["message"] = ""
-        save_job(job)
-        _start_job(job)
-    return job
+    finally:
+        if not started:
+            with _lock:
+                _active_jobs.discard(str(job.get("id", "")))
 
 
 def import_job_from_path(path_value: str, mode: str = "full", pages: str = "", demo_mode: bool = False, start_translation: bool = False) -> dict[str, Any]:
@@ -1266,17 +1443,18 @@ def import_job_from_path(path_value: str, mode: str = "full", pages: str = "", d
 
 
 def translate_job(job_id: str, mode: str, pages: str, demo_mode: bool) -> dict[str, Any]:
-    job = load_job(job_id)
-    if not job:
-        raise ValueError("任务不存在。")
-    if job.get("status") in {"queued", "running"}:
-        raise ValueError("任务正在处理中，请等待当前任务完成。")
-    mode = mode if mode in {"trial", "full"} else "full"
-    pages = parse_pages(pages if mode == "trial" else "", int(job["page_count"]))
-    job.update({"status": "queued", "progress": None, "progress_indeterminate": True, "stage": "queued", "stage_current": 0, "stage_total": None, "mode": mode, "pages": pages, "demo_mode": bool(demo_mode), "translation_scope": None, "translation_reused": False, "translated_title": None, "title_checked": False, "error": "", "message": ""})
-    save_job(job)
-    _start_job(job)
-    return job
+    with _lock:
+        job = load_job(job_id)
+        if not job:
+            raise ValueError("任务不存在。")
+        if job.get("status") in {"queued", "running"}:
+            raise ValueError("任务正在处理中，请等待当前任务完成。")
+        mode = mode if mode in {"trial", "full"} else "full"
+        pages = parse_pages(pages if mode == "trial" else "", int(job["page_count"]))
+        job.update({"status": "queued", "progress": None, "progress_indeterminate": True, "stage": "queued", "stage_current": 0, "stage_total": None, "mode": mode, "pages": pages, "demo_mode": bool(demo_mode), "translation_scope": None, "translation_reused": False, "translated_title": None, "title_checked": False, "error": "", "message": ""})
+        save_job(job)
+        _start_job(job)
+        return job
 
 
 def file_path(job_id: str, kind: str) -> Path | None:

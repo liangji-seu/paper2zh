@@ -319,6 +319,15 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json.loads(body.decode("utf-8")) if body else {}
                 self._json(200, apply_action(payload))
                 return
+            if len(route_parts) == 4 and route_parts[:2] == ["api", "jobs"] and route_parts[3] == "delete":
+                if request_content_type.split(";", 1)[0].strip().lower() != "application/json":
+                    raise ValueError("删除文献必须使用 application/json。")
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                if payload not in ({}, None) and not isinstance(payload, dict):
+                    raise ValueError("删除文献参数格式无效。")
+                library_state = apply_action({"action": "delete_document", "job_id": route_parts[2]})
+                self._json(200, {"deleted": True, "id": route_parts[2], "library": library_state})
+                return
             if path == "/api/settings":
                 if request_content_type.split(";", 1)[0].strip().lower() != "application/json":
                     raise ValueError("设置保存必须使用 application/json。")

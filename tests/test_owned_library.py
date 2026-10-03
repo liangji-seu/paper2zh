@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from pypdf import PdfWriter
 
-from app import core
+from app import catalog, core, library, markdown_export
 
 
 class OwnedLibraryTests(unittest.TestCase):
@@ -28,6 +28,8 @@ class OwnedLibraryTests(unittest.TestCase):
             item.start()
         core._catalog_synced.clear()
         core._jobs.clear()
+        core._active_jobs.clear()
+        core._deleted_jobs.clear()
 
     def tearDown(self):
         for item in reversed(self.patches):
@@ -147,6 +149,154 @@ class OwnedLibraryTests(unittest.TestCase):
         fake_module = type("FakeFitz", (), {"open": staticmethod(lambda _path: FakeDocument())})
         with patch.dict(sys.modules, {"pymupdf": fake_module}):
             self.assertEqual(core._extract_translated_title(Path("synthetic.pdf"), "fallback.pdf"), "面向下肢外骨骼的人机协同控制方法")
+
+    def test_delete_removes_owned_bundle_and_keeps_external_source_and_outputs(self):
+        source = Path(self.tmp.name) / "original.pdf"
+        source.write_bytes(self.pdf())
+        external = source.parent / "translate" / "original.zh.pdf"
+        external.parent.mkdir()
+        external.write_bytes(b"external translation")
+        job = core.create_job(source.name, source.read_bytes(), "", "full", False, start_translation=False)
+        core._write_external_source(job, source)
+        job_dir = self.jobs / job["id"]
+        (job_dir / "translate").mkdir()
+        (job_dir / "translate" / "paper.zh.pdf").write_bytes(b"owned translation")
+        (job_dir / "markdown").mkdir()
+        (job_dir / "markdown" / "source.md").write_text("owned", encoding="utf-8")
+        (job_dir / "markdown" / "translated.md").write_text("owned translation", encoding="utf-8")
+        (job_dir / "markdown" / "metadata.json").write_text(json.dumps({"job_id": job["id"], "title": "Owned"}), encoding="utf-8")
+        (job_dir / "annotations.json").write_text("{}", encoding="utf-8")
+        core.save_job(job)
+        markdown_export.refresh_library_index(self.data, self.jobs)
+        folder = library.apply_action({"action": "create_folder", "name": "Keep"})["folders"][0]["id"]
+        library.apply_action({"action": "move_document", "job_id": job["id"], "folder_id": folder})
+        library.apply_action({"action": "delete_document", "job_id": job["id"]})
+        self.assertFalse(job_dir.exists())
+        self.assertTrue(source.is_file())
+        self.assertEqual(external.read_bytes(), b"external translation")
+        self.assertNotIn(job["id"], library.get_library()["documents"])
+        self.assertFalse(any(row["job_id"] == job["id"] for row in catalog.list_documents(self.data)))
+        index = json.loads((self.data / "index.json").read_text(encoding="utf-8"))
+        self.assertNotIn(job["id"], {entry["id"] for entry in index["entries"]})
+
+    def test_delete_rejects_busy_markdown_timer_and_queue(self):
+        job = core.create_job("paper.pdf", self.pdf(), "", "full", False, start_translation=False)
+        job["status"] = "completed"
+        core.save_job(job)
+        key = f"{self.jobs.resolve()}::{job['id']}"
+        core._markdown_scheduled.add(key)
+        try:
+            with self.assertRaisesRegex(ValueError, "处理中|Markdown"):
+                core.delete_job(job["id"])
+        finally:
+            core._markdown_scheduled.discard(key)
+        with markdown_export._pending_lock:
+            markdown_export._pending.add((str(self.jobs.resolve()), job["id"]))
+        try:
+            with self.assertRaisesRegex(ValueError, "处理中|Markdown"):
+                core.delete_job(job["id"])
+        finally:
+            with markdown_export._pending_lock:
+                markdown_export._pending.discard((str(self.jobs.resolve()), job["id"]))
+
+    def test_library_mapping_is_restored_when_delete_is_refused(self):
+        job = core.create_job("paper.pdf", self.pdf(), "", "full", False, start_translation=False)
+        folder = library.apply_action({"action": "create_folder", "name": "Keep"})["folders"][0]["id"]
+        library.apply_action({"action": "move_document", "job_id": job["id"], "folder_id": folder})
+        core._active_jobs.add(job["id"])
+        try:
+            with self.assertRaisesRegex(ValueError, "处理中"):
+                library.apply_action({"action": "delete_document", "job_id": job["id"]})
+        finally:
+            core._active_jobs.discard(job["id"])
+        self.assertEqual(library.get_library()["documents"].get(job["id"]), folder)
+
+    def test_delete_restores_duplicate_source_index(self):
+        first = core.create_job("first.pdf", self.pdf(), "", "full", False, start_translation=False)
+        second_id = "legacy-duplicate"
+        second_dir = self.jobs / second_id
+        second_dir.mkdir()
+        (second_dir / "source.pdf").write_bytes((self.jobs / first["id"] / "source.pdf").read_bytes())
+        second = dict(first, id=second_id, filename="second.pdf", display_title="second.pdf", created_at="2999-01-01T00:00:00+00:00")
+        (second_dir / "job.json").write_text(json.dumps(second), encoding="utf-8")
+        catalog.update(self.data, second)
+        core.delete_job(first["id"])
+        connection = sqlite3.connect(self.data / "catalog.db")
+        try:
+            row = connection.execute("SELECT job_id FROM source_index WHERE source_sha256 = ?", (first["source_sha256"],)).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(row[0], second_id)
+
+    def test_delete_restores_job_when_catalog_cleanup_fails(self):
+        job = core.create_job("paper.pdf", self.pdf(), "", "full", False, start_translation=False)
+        job_dir = self.jobs / job["id"]
+        with patch.object(catalog, "remove", side_effect=RuntimeError("catalog locked")):
+            with self.assertRaisesRegex(OSError, "删除已取消"):
+                core.delete_job(job["id"])
+        self.assertTrue((job_dir / "source.pdf").is_file())
+        self.assertTrue((job_dir / "job.json").is_file())
+
+    def test_delete_rejects_nested_symlink_escape(self):
+        job = core.create_job("paper.pdf", self.pdf(), "", "full", False, start_translation=False)
+        job_dir = self.jobs / job["id"]
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        link = job_dir / "escape"
+        try:
+            os.symlink(outside, link, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("当前 Windows 环境不允许创建目录符号链接")
+        with self.assertRaisesRegex(ValueError, "符号链接|联接点"):
+            core.delete_job(job["id"])
+        self.assertTrue((job_dir / "source.pdf").is_file())
+        self.assertTrue(outside.is_dir())
+
+    def test_delete_rejects_reparse_staging_directory(self):
+        job = core.create_job("paper.pdf", self.pdf(), "", "full", False, start_translation=False)
+        outside = Path(self.tmp.name) / "staging-outside"
+        outside.mkdir()
+        staging = self.data / ".delete-staging"
+        try:
+            os.symlink(outside, staging, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("当前 Windows 环境不允许创建目录符号链接")
+        with self.assertRaisesRegex(ValueError, "暂存目录"):
+            core.delete_job(job["id"])
+        self.assertTrue((self.jobs / job["id"] / "source.pdf").is_file())
+
+    def test_delete_restores_job_catalog_and_index_when_markdown_refresh_fails(self):
+        job = core.create_job("paper.pdf", self.pdf(), "", "full", False, start_translation=False)
+        job_dir = self.jobs / job["id"]
+        (job_dir / "markdown").mkdir()
+        (job_dir / "markdown" / "source.md").write_text("source", encoding="utf-8")
+        (job_dir / "markdown" / "translated.md").write_text("translated", encoding="utf-8")
+        (job_dir / "markdown" / "metadata.json").write_text(json.dumps({"job_id": job["id"]}), encoding="utf-8")
+        markdown_export.refresh_library_index(self.data, self.jobs)
+        before_index = (self.data / "index.json").read_bytes()
+        with patch.object(markdown_export, "refresh_library_index", side_effect=RuntimeError("index locked")):
+            with self.assertRaisesRegex(OSError, "索引刷新失败，删除已取消"):
+                core.delete_job(job["id"])
+        self.assertTrue((job_dir / "source.pdf").is_file())
+        self.assertEqual((self.data / "index.json").read_bytes(), before_index)
+        self.assertTrue(any(row["job_id"] == job["id"] for row in catalog.list_documents(self.data)))
+
+    def test_deleted_job_rejects_stale_save_and_translate(self):
+        job = core.create_job("paper.pdf", self.pdf(), "", "full", False, start_translation=False)
+        core.delete_job(job["id"])
+        with self.assertRaisesRegex(FileNotFoundError, "已删除"):
+            core.save_job(job)
+        with self.assertRaisesRegex(ValueError, "不存在"):
+            core.translate_job(job["id"], "full", "", False)
+
+    def test_library_write_failure_keeps_job_and_association(self):
+        job = core.create_job("paper.pdf", self.pdf(), "", "full", False, start_translation=False)
+        library.apply_action({"action": "move_document", "job_id": job["id"], "folder_id": None})
+        with patch.object(library, "_write", side_effect=RuntimeError("library locked")):
+            with self.assertRaisesRegex(RuntimeError, "library locked"):
+                library.apply_action({"action": "delete_document", "job_id": job["id"]})
+        self.assertTrue((self.jobs / job["id"] / "source.pdf").is_file())
+        self.assertIn(job["id"], library.get_library()["documents"])
 
 
 if __name__ == "__main__":
