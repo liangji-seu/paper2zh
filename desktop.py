@@ -40,6 +40,113 @@ def configure() -> int:
     return port
 
 
+def _copy_text_to_windows_clipboard(text: str) -> None:
+    """Put UTF-16 text into the native clipboard without shelling out."""
+    if sys.platform != "win32":
+        raise RuntimeError("Markdown 目录复制仅支持 Windows 原生桌面桥。")
+    if not isinstance(text, str):
+        raise TypeError("剪贴板内容无效。")
+
+    kernel32 = ctypes.windll.kernel32
+    user32 = ctypes.windll.user32
+    size_t = ctypes.c_size_t
+    void_p = ctypes.c_void_p
+    bool_t = ctypes.c_bool
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, size_t]
+    kernel32.GlobalAlloc.restype = void_p
+    kernel32.GlobalLock.argtypes = [void_p]
+    kernel32.GlobalLock.restype = void_p
+    kernel32.GlobalUnlock.argtypes = [void_p]
+    kernel32.GlobalUnlock.restype = bool_t
+    kernel32.GlobalFree.argtypes = [void_p]
+    kernel32.GlobalFree.restype = void_p
+    user32.OpenClipboard.argtypes = [void_p]
+    user32.OpenClipboard.restype = bool_t
+    user32.EmptyClipboard.argtypes = []
+    user32.EmptyClipboard.restype = bool_t
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, void_p]
+    user32.SetClipboardData.restype = void_p
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = bool_t
+    user32.CreateWindowExW.argtypes = [
+        ctypes.c_uint,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        void_p,
+        void_p,
+        void_p,
+        void_p,
+    ]
+    user32.CreateWindowExW.restype = void_p
+    user32.DestroyWindow.argtypes = [void_p]
+    user32.DestroyWindow.restype = bool_t
+    kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+    kernel32.GetModuleHandleW.restype = void_p
+
+    # CF_UNICODETEXT expects a movable global allocation containing a trailing
+    # UTF-16 NUL. Windows takes ownership only after SetClipboardData succeeds.
+    payload = (text + "\0").encode("utf-16-le")
+    handle = kernel32.GlobalAlloc(0x0002, len(payload))  # GMEM_MOVEABLE
+    if not handle:
+        raise OSError("Windows 无法分配剪贴板内存。")
+    # A message-only owner gives OpenClipboard a real HWND even when the
+    # bridge is called from a worker thread without an active webview window.
+    owner = user32.CreateWindowExW(
+        0,
+        "STATIC",
+        "paper2zh clipboard owner",
+        0,
+        0,
+        0,
+        0,
+        0,
+        ctypes.c_void_p(-3),  # HWND_MESSAGE
+        None,
+        kernel32.GetModuleHandleW(None),
+        None,
+    )
+    if not owner:
+        kernel32.GlobalFree(handle)
+        raise OSError("无法创建 Windows 剪贴板临时窗口。")
+    opened = False
+    transferred = False
+    try:
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            raise OSError("Windows 无法锁定剪贴板内存。")
+        try:
+            ctypes.memmove(pointer, payload, len(payload))
+        finally:
+            kernel32.GlobalUnlock(handle)
+
+        # Another process may briefly own the clipboard. Retry only for a
+        # short bounded interval so copying never blocks the UI for long.
+        for attempt in range(4):
+            if user32.OpenClipboard(owner):
+                opened = True
+                break
+            if attempt < 3:
+                time.sleep(0.05)
+        if not opened:
+            raise OSError("Windows 剪贴板正忙，请稍后重试。")
+        if not user32.EmptyClipboard():
+            raise OSError("无法清空 Windows 剪贴板。")
+        if not user32.SetClipboardData(13, handle):  # CF_UNICODETEXT
+            raise OSError("无法写入 Windows 剪贴板。")
+        transferred = True
+    finally:
+        if opened:
+            user32.CloseClipboard()
+        user32.DestroyWindow(owner)
+        if not transferred:
+            kernel32.GlobalFree(handle)
+
+
 class DesktopBridge:
     def __init__(self) -> None:
         # pywebview recursively exposes public attributes to JavaScript.
@@ -102,6 +209,25 @@ class DesktopBridge:
             return {"saved": True, "filename": saved.name}
         except (ValueError, OSError, FileNotFoundError) as exc:
             return {"error": str(exc)}
+
+    def copy_markdown_directory(self, job_id: str) -> dict:
+        """Copy only the verified Markdown directory for a known job."""
+        if not isinstance(job_id, str) or not job_id:
+            return {"error": "任务 id 无效。"}
+        try:
+            from app.core import JOBS
+            from app.markdown_export import MarkdownExportError, markdown_directory
+
+            directory = markdown_directory(JOBS, job_id)
+        except MarkdownExportError as exc:
+            return {"error": str(exc)}
+        except (OSError, ValueError) as exc:
+            return {"error": f"Markdown 目录不可用：{exc}"}
+        try:
+            _copy_text_to_windows_clipboard(str(directory))
+        except (OSError, RuntimeError, TypeError) as exc:
+            return {"error": str(exc)}
+        return {"copied": True, "directory": str(directory)}
 
     def get_workspace_preferences(self) -> dict:
         from app.core import get_workspace_preferences

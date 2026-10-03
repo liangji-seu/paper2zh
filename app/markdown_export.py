@@ -38,6 +38,113 @@ class MarkdownExportError(RuntimeError):
     """Raised when a Markdown export cannot be safely published."""
 
 
+def markdown_directory(
+    jobs: str | os.PathLike[str],
+    job_id: Any,
+    job: Mapping[str, Any] | None = None,
+) -> Path:
+    """Return a verified, completed job's Markdown export directory.
+
+    This is deliberately a read-only guard used by both the HTTP endpoint and
+    the native desktop clipboard bridge.  It derives every path from the
+    trusted jobs root and the validated job ID; paths in ``job.json`` or the
+    Markdown manifest are never followed.
+    """
+    jobs_root = _as_path(jobs)
+    safe_id = _safe_job_id(job_id)
+    job_dir = _inside(jobs_root, safe_id)
+    if not job_dir.is_dir():
+        raise MarkdownExportError("任务目录不存在。")
+
+    if job is None:
+        try:
+            payload = json.loads((job_dir / "job.json").read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+            raise MarkdownExportError("任务不存在。") from exc
+        job = payload if isinstance(payload, dict) else None
+    if not isinstance(job, Mapping) or str(job.get("id", "")) != safe_id:
+        raise MarkdownExportError("任务不存在。")
+    if str(job.get("status", "")) != "completed":
+        raise MarkdownExportError("任务尚未完成，Markdown 目录尚未生成。")
+
+    try:
+        markdown_candidate = job_dir / "markdown"
+        if not markdown_candidate.is_dir():
+            raise FileNotFoundError(markdown_candidate)
+        markdown_dir = markdown_candidate.resolve()
+        markdown_dir.relative_to(job_dir.resolve())
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise MarkdownExportError("Markdown 目录尚未生成。") from exc
+    if not markdown_dir.is_dir():
+        raise MarkdownExportError("Markdown 目录尚未生成。")
+
+    files: dict[str, Path] = {}
+    for name in ("source.md", "translated.md", "metadata.json"):
+        path = markdown_dir / name
+        try:
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            resolved = path.resolve()
+            resolved.relative_to(markdown_dir)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise MarkdownExportError("Markdown 导出尚未完整生成。") from exc
+        if not resolved.is_file():
+            raise MarkdownExportError("Markdown 导出尚未完整生成。")
+        files[name] = resolved
+
+    metadata = _read_json(files["metadata.json"])
+    if not metadata or str(metadata.get("job_id", "")) != safe_id:
+        raise MarkdownExportError("Markdown 元数据无效，目录不可用。")
+    expected = {
+        "version": EXPORT_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "converter": CONVERTER_NAME,
+        "converter_version": CONVERTER_VERSION,
+    }
+    if any(metadata.get(key) != value for key, value in expected.items()):
+        raise MarkdownExportError("Markdown 元数据版本不匹配，目录不可用。")
+    # Match the cheap completion manifest checks used by job listing.  This
+    # reads only small JSON manifests and never hashes or extracts a PDF.
+    if "source_sha256" in job and metadata.get("source_sha256") != job.get("source_sha256"):
+        raise MarkdownExportError("Markdown 导出与当前源文献不匹配。")
+    translation_meta = _read_json(job_dir / "translation-meta.json")
+    if translation_meta and metadata.get("translated_sha256") != translation_meta.get("translated_sha256"):
+        raise MarkdownExportError("Markdown 导出与当前译文不匹配。")
+    if "page_count" in job:
+        scope = "demo" if job.get("demo_mode") else str(job.get("translation_scope") or job.get("mode") or "full").lower()
+        if scope not in {"full", "trial", "demo"}:
+            scope = "full"
+        raw_pages = str(job.get("pages") or "").strip()
+        try:
+            if scope == "full" or not raw_pages:
+                selected = list(range(1, int(job.get("page_count") or 0) + 1))
+            else:
+                selected = []
+                for part in raw_pages.split(","):
+                    bits = part.strip().split("-", 1)
+                    first = int(bits[0])
+                    last = int(bits[1]) if len(bits) == 2 and bits[1] else first
+                    selected.extend(range(first, last + 1))
+                selected = sorted(set(selected))
+        except (TypeError, ValueError):
+            raise MarkdownExportError("任务页码范围无效，Markdown 目录不可用。")
+        if metadata.get("scope") != scope or metadata.get("selected_pages") != selected:
+            raise MarkdownExportError("Markdown 导出范围与当前任务不匹配。")
+
+    # Manifest PDF references are metadata only, but reject absolute or
+    # escaping values so a malformed manifest can never become a path source.
+    for key in ("source_pdf", "translated_pdf"):
+        value = metadata.get(key)
+        if value is not None:
+            try:
+                if not isinstance(value, str) or Path(value).is_absolute():
+                    raise ValueError(value)
+                Path(markdown_dir / value).resolve().relative_to(job_dir.resolve())
+            except (OSError, ValueError, TypeError) as exc:
+                raise MarkdownExportError("Markdown 元数据包含越界路径。") from exc
+    return markdown_dir
+
+
 def _as_path(value: str | os.PathLike[str]) -> Path:
     return Path(value).expanduser().resolve()
 
@@ -387,4 +494,4 @@ def enqueue_completed_exports(data: str | os.PathLike[str], jobs: str | os.PathL
     return count
 
 
-__all__ = ["MarkdownExportError", "enqueue_completed_exports", "enqueue_export", "export_job"]
+__all__ = ["MarkdownExportError", "enqueue_completed_exports", "enqueue_export", "export_job", "markdown_directory"]

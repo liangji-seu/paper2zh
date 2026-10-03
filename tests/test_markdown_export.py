@@ -81,6 +81,34 @@ class MarkdownExportTests(unittest.TestCase):
         self.assertEqual([entry["id"] for entry in index["entries"]], ["job-1"])
         self.assertEqual(index["entries"][0]["source"], "jobs/job-1/markdown/source.md")
 
+    def test_markdown_directory_requires_a_complete_owned_bundle(self):
+        markdown_export.export_job(self.data, self.jobs, self._job())
+        directory = markdown_export.markdown_directory(self.jobs, "job-1", self._job())
+        self.assertEqual(directory, (self.job_dir / "markdown").resolve())
+        with self.assertRaisesRegex(markdown_export.MarkdownExportError, "不安全"):
+            markdown_export.markdown_directory(self.jobs, "../outside", self._job(id="../outside"))
+
+        incomplete = self.jobs / "job-2"
+        incomplete.mkdir()
+        (incomplete / "job.json").write_text(json.dumps(self._job(id="job-2")), encoding="utf-8")
+        with self.assertRaisesRegex(markdown_export.MarkdownExportError, "尚未"):
+            markdown_export.markdown_directory(self.jobs, "job-2")
+
+    def test_markdown_directory_rejects_symlink_escape(self):
+        markdown_export.export_job(self.data, self.jobs, self._job())
+        outside = self.data / "outside"
+        outside.mkdir()
+        escaped = outside / "source.md"
+        escaped.write_text("outside", encoding="utf-8")
+        source = self.job_dir / "markdown" / "source.md"
+        source.unlink()
+        try:
+            source.symlink_to(escaped)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        with self.assertRaises(markdown_export.MarkdownExportError):
+            markdown_export.markdown_directory(self.jobs, "job-1", self._job())
+
     def test_trial_keeps_full_source_and_limits_translated_pages(self):
         result = markdown_export.export_job(self.data, self.jobs, self._job(mode="trial", translation_scope="trial", pages="2"))
         source = (self.job_dir / "markdown" / "source.md").read_text(encoding="utf-8")

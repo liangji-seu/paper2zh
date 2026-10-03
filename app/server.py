@@ -23,6 +23,7 @@ from .annotations import (
 )
 from .core import DATA, JOBS, MAX_UPLOAD_BYTES, create_job, create_job_from_path, file_path, get_workspace_preferences, list_jobs, load_job, public_settings, read_settings, render_page, save_settings, save_workspace_preferences, translate_job
 from .library import MAX_LIBRARY_BODY_BYTES, apply_action, get_library
+from .markdown_export import MarkdownExportError, markdown_directory
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "static"
@@ -167,6 +168,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, get_workspace_preferences())
             return
         parts = [x for x in path.split("/") if x]
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "jobs" and parts[3] == "markdown-location":
+            try:
+                directory = markdown_directory(JOBS, parts[2])
+            except MarkdownExportError as exc:
+                status = 400 if "ID" in str(exc) or "不安全" in str(exc) else 404
+                self._json(status, {"error": str(exc)})
+                return
+            self._json(200, {"directory": str(directory)})
+            return
         if len(parts) == 3 and parts[0] == "api" and parts[1] == "jobs":
             job = load_job(parts[2])
             if not job:

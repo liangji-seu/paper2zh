@@ -4,7 +4,7 @@ paper2zh 在本机浏览器中管理和阅读 PDF。左侧可按嵌套文件夹�
 
 ## 安装桌面版
 
-从 [当前公开发布页](https://github.com/liangji-seu/paper2zh/releases/latest)下载 Windows 安装包；当前源码版本为 `v1.1.0`（版本号见 `VERSION`）。安装程序默认安装在 `E:\paper2zh`，无需管理员权限；系统需要 Microsoft WebView2 运行时。桌面版附带独立 Python 3.11 与 BabelDOC 依赖，不要求系统安装 Python。首次翻译可能下载模型、字体等资源，请保持网络连接。
+从 [当前公开发布页](https://github.com/liangji-seu/paper2zh/releases/latest)下载 Windows 安装包；当前源码版本为 `v1.1.1`（版本号见 `VERSION`）。安装程序默认安装在 `E:\paper2zh`，无需管理员权限；系统需要 Microsoft WebView2 运行时。桌面版附带独立 Python 3.11 与 BabelDOC 依赖，不要求系统安装 Python。首次翻译可能下载模型、字体等资源，请保持网络连接。
 
 桌面版使用系统文件窗口选择 PDF。文献、译文、批注及 SQLite 索引保存在安装目录的 `library/` 中，默认路径为 `E:\paper2zh\library`。升级后首次打开会复制旧 `%LOCALAPPDATA%\paper2zh` 中的文献与文件夹记录，旧目录保留。API 配置和已有模型缓存继续使用原用户目录；API Key 由当前 Windows 用户的 DPAPI 加密。安装包不包含用户论文、数据库、Markdown、Key、批注或模型缓存。源码开发版继续使用独立的 `data/`。
 
@@ -40,7 +40,7 @@ BabelDOC 会尽量保留论文的公式、图形与页面结构，但中文长�
 
 ## 验证
 
-在项目目录运行 `python -m unittest discover -s tests -v`、`node --test tests/reader-geometry.test.mjs tests/pan-interaction.test.mjs`，以及 `python -m py_compile app/core.py app/server.py app/annotations.py app/library.py run.py`。自动测试不调用真实 API。16 MiB 文件的独立服务端 tracemalloc 回归测试记录一次性读取峰值 16,786,403 bytes、分块发送峰值 140,830 bytes；这是该测试的峰值对比，不代表整体速度。另使用两页合成英文测试 PDF 验证了本机真实翻译：各页完整中文正文、公式和矢量曲线保留；该测试不使用用户研究论文。复杂表格、扫描页和特殊字体仍需人工检查。
+在项目目录运行 `python -m unittest discover -s tests -v`、`node --test tests/reader-geometry.test.mjs tests/pan-interaction.test.mjs tests/file-context-menu.test.mjs`，以及 `python -m py_compile app/core.py app/server.py app/annotations.py app/library.py run.py`。自动测试不调用真实 API。16 MiB 文件的独立服务端 tracemalloc 回归测试记录一次性读取峰值 16,786,403 bytes、分块发送峰值 140,830 bytes；这是该测试的峰值对比，不代表整体速度。另使用两页合成英文测试 PDF 验证了本机真实翻译：各页完整中文正文、公式和矢量曲线保留；该测试不使用用户研究论文。复杂表格、扫描页和特殊字体仍需人工检查。
 
 官方依据：BabelDOC https://github.com/funstory-ai/BabelDOC ；DeepSeek 思考模式 https://api-docs.deepseek.com/guides/thinking_mode/ 。
 

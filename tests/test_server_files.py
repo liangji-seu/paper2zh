@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import json
 import socket
 import sys
 import tempfile
@@ -155,6 +156,34 @@ class FileResponseTests(unittest.TestCase):
         print(f"service tracemalloc peak bytes: read_bytes={old_peak}, chunked={new_peak}")
         self.assertGreater(old_peak, 8 * 1024 * 1024)
         self.assertGreater(old_peak, new_peak * 4)
+
+    def test_markdown_location_route_returns_only_verified_completed_bundle(self):
+        jobs = self.root / "library" / "jobs"
+        markdown = jobs / "job-1" / "markdown"
+        markdown.mkdir(parents=True)
+        (jobs / "job-1" / "job.json").write_text(json.dumps({"id": "job-1", "status": "completed"}), encoding="utf-8")
+        (markdown / "source.md").write_text("# source", encoding="utf-8")
+        (markdown / "translated.md").write_text("# translated", encoding="utf-8")
+        (markdown / "metadata.json").write_text(json.dumps({
+            "version": "1", "schema_version": "2", "job_id": "job-1",
+            "converter": "PyMuPDF with pypdf fallback", "converter_version": "1",
+        }), encoding="utf-8")
+        previous_jobs = server.JOBS
+        server.JOBS = jobs
+        try:
+            status, _headers, body = self.request("/api/jobs/job-1/markdown-location")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), {"directory": str(markdown.resolve())})
+
+            status, _headers, body = self.request("/api/jobs/missing/markdown-location")
+            self.assertEqual(status, 404)
+            self.assertIn("任务目录不存在", body.decode("utf-8"))
+
+            status, _headers, body = self.request("/api/jobs/%2e%2e/markdown-location")
+            self.assertEqual(status, 400)
+            self.assertIn("不安全", body.decode("utf-8"))
+        finally:
+            server.JOBS = previous_jobs
 
 
 if __name__ == "__main__":
