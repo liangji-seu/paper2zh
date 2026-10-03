@@ -68,6 +68,9 @@ jobs:
         shell: pwsh
         run: |
           node --check static/workspace.mjs
+          node --check static/reader.mjs
+          node --check static/reader-geometry.mjs
+          node --test tests/reader-geometry.test.mjs
 
       - name: Build Windows installer
         shell: pwsh

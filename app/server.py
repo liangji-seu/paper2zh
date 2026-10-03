@@ -29,6 +29,34 @@ STATIC = ROOT / "static"
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("PAPER_TRANSLATOR_PORT", "8765"))
 LOCAL_ORIGINS = {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}
+FILE_CHUNK_SIZE = 64 * 1024
+
+
+def _parse_single_range(value: str | None, size: int) -> tuple[int, int] | str | None:
+    """Parse one satisfiable byte range; leave unsupported Range headers at 200."""
+    if not value or not value.startswith("bytes="):
+        return None
+    spec = value[6:].strip()
+    if not spec or "," in spec or "-" not in spec:
+        return None
+    first, last = (part.strip() for part in spec.split("-", 1))
+    try:
+        if not first:
+            suffix = int(last)
+            if suffix <= 0 or size <= 0:
+                return "unsatisfiable"
+            return max(0, size - suffix), size - 1
+        start = int(first)
+        if start < 0 or start >= size:
+            return "unsatisfiable"
+        if not last:
+            return start, size - 1
+        end = int(last)
+        if end < start:
+            return "unsatisfiable"
+        return start, min(end, size - 1)
+    except ValueError:
+        return None
 
 
 def test_connection() -> dict[str, object]:
@@ -198,7 +226,55 @@ class Handler(BaseHTTPRequestHandler):
             return
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         disposition = "inline" if inline else "attachment"
-        self._send(200, path.read_bytes(), content_type, {"Content-Disposition": f'{disposition}; filename="{path.name}"'})
+        try:
+            size = path.stat().st_size
+        except OSError:
+            self._json(404, {"error": "文件不存在。"})
+            return
+        range_header = self.headers.get("Range")
+        accepts_range = content_type == "application/pdf"
+        byte_range = _parse_single_range(range_header, size) if accepts_range and not self.headers.get("If-Range") else None
+        if byte_range == "unsatisfiable":
+            try:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", "0")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Content-Disposition", f'{disposition}; filename="{path.name}"')
+                self.end_headers()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+            return
+        start, end = byte_range if byte_range else (0, size - 1)
+        status = 206 if byte_range else 200
+        length = max(0, end - start + 1)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(length))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Disposition", f'{disposition}; filename="{path.name}"')
+            if accepts_range:
+                self.send_header("Accept-Ranges", "bytes")
+            if byte_range:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            if not length:
+                return
+            with path.open("rb") as stream:
+                stream.seek(start)
+                remaining = length
+                while remaining:
+                    chunk = stream.read(min(FILE_CHUNK_SIZE, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
