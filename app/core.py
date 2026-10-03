@@ -718,17 +718,20 @@ def save_job(job: dict[str, Any]) -> None:
     temporary = job_dir / f".job.{uuid.uuid4().hex}.tmp"
     try:
         temporary.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            catalog.update(DATA, job)
+        except Exception:
+            # The job JSON is the compatibility source of truth; a transient
+            # index failure must not make an already completed translation fail.
+            pass
+        # Publish the JSON only after catalog.update has closed its SQLite
+        # connection. Pollers therefore cannot observe completed while the
+        # database is still held open on Windows.
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
     with _lock:
         _jobs[job["id"]] = dict(job)
-    try:
-        catalog.update(DATA, job)
-    except Exception:
-        # The job JSON is the compatibility source of truth; a transient
-        # index failure must not make an already completed translation fail.
-        pass
 
 
 def list_jobs() -> list[dict[str, Any]]:
