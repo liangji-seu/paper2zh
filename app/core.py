@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 import os
 import queue
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,13 +22,26 @@ from pypdf import PdfReader
 
 from .security import mask, protect, unprotect
 from .progress import parse_engine_progress
+from . import catalog
+from .pdf_worker import pdf_serialized
 
 
 ROOT = Path(__file__).resolve().parent.parent
 _configured_data = os.environ.get("PAPER_TRANSLATOR_DATA_DIR", "").strip()
-DATA = Path(_configured_data).expanduser() if _configured_data else ROOT / "data"
+if _configured_data:
+    DATA = Path(_configured_data).expanduser()
+elif getattr(sys, "_MEIPASS", None):
+    DATA = Path(sys.executable).resolve().parent / "library"
+else:
+    DATA = ROOT / "data"
 JOBS = DATA / "jobs"
-SETTINGS_PATH = DATA / "settings.json"
+_configured_settings = os.environ.get("PAPER_TRANSLATOR_SETTINGS_PATH", "").strip()
+if _configured_settings:
+    SETTINGS_PATH = Path(_configured_settings).expanduser()
+elif getattr(sys, "_MEIPASS", None) and os.environ.get("LOCALAPPDATA"):
+    SETTINGS_PATH = Path(os.environ["LOCALAPPDATA"]) / "paper2zh" / "settings.json"
+else:
+    SETTINGS_PATH = DATA / "settings.json"
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_LOCAL_IMPORT_BYTES = MAX_UPLOAD_BYTES
 EXTERNAL_SOURCE_META_NAME = "external-source.json"
@@ -41,11 +56,61 @@ DEFAULT_SETTINGS = {
 
 _lock = threading.RLock()
 _jobs: dict[str, dict[str, Any]] = {}
+_catalog_synced: set[str] = set()
+_migration_lock = threading.RLock()
+_sha_cache: dict[tuple[str, int, int, int], str] = {}
+_markdown_scheduled: set[str] = set()
 
 
 def ensure_dirs() -> None:
-    DATA.mkdir(exist_ok=True)
-    JOBS.mkdir(exist_ok=True)
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        JOBS.mkdir(parents=True, exist_ok=True)
+        _migrate_legacy_data()
+        key = str(DATA.resolve())
+        if key not in _catalog_synced:
+            catalog.sync(DATA, JOBS)
+            _catalog_synced.add(key)
+    except Exception as exc:
+        raise OSError(f"文献库目录不可写：{DATA}（{exc}）") from exc
+
+
+def _migrate_legacy_data() -> None:
+    """Copy the old user data once, retaining the old directory."""
+    source_value = os.environ.get("PAPER_TRANSLATOR_LEGACY_DATA_DIR", "").strip()
+    if not source_value:
+        return
+    source = Path(source_value).expanduser()
+    if not source.is_dir() or source.resolve() == DATA.resolve():
+        return
+    marker = DATA / ".migration-v1.complete"
+    with _migration_lock:
+        if marker.exists():
+            return
+        try:
+            old_jobs = source / "jobs"
+            if old_jobs.is_dir():
+                for item in old_jobs.iterdir():
+                    destination = JOBS / item.name
+                    if not destination.exists():
+                        temporary = JOBS / f".{item.name}.migration-{uuid.uuid4().hex}.tmp"
+                        try:
+                            if item.is_dir():
+                                shutil.copytree(item, temporary)
+                            else:
+                                _atomic_copy(item, temporary)
+                            os.replace(temporary, destination)
+                        finally:
+                            if temporary.is_dir():
+                                shutil.rmtree(temporary, ignore_errors=True)
+                            else:
+                                temporary.unlink(missing_ok=True)
+            old_library = source / "library.json"
+            if old_library.is_file() and not (DATA / "library.json").exists():
+                _atomic_copy(old_library, DATA / "library.json")
+            marker.write_text("migration complete\n", encoding="utf-8")
+        except Exception as exc:
+            raise OSError(f"旧文献库迁移失败，原数据已保留，未标记迁移完成：{exc}") from exc
 
 
 def read_settings() -> dict[str, Any]:
@@ -101,6 +166,51 @@ def save_settings(values: dict[str, Any]) -> dict[str, Any]:
     return public_settings()
 
 
+PREFERENCES_PATH = DATA / "workspace-preferences.json"
+_PREFERENCE_DEFAULTS = {"sidebar_width": 280, "sidebar_collapsed": False}
+
+
+def get_workspace_preferences() -> dict[str, Any]:
+    path = DATA / "workspace-preferences.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        payload = {}
+    result = dict(_PREFERENCE_DEFAULTS)
+    if isinstance(payload, dict):
+        width = payload.get("sidebar_width")
+        if isinstance(width, (int, float)) and not isinstance(width, bool):
+            result["sidebar_width"] = max(180, min(420, int(width)))
+        if isinstance(payload.get("sidebar_collapsed"), bool):
+            result["sidebar_collapsed"] = payload["sidebar_collapsed"]
+    return result
+
+
+def save_workspace_preferences(values: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(values, dict):
+        raise ValueError("工作区偏好格式无效。")
+    result = get_workspace_preferences()
+    if "sidebar_width" in values:
+        width = values["sidebar_width"]
+        if isinstance(width, bool) or not isinstance(width, (int, float)):
+            raise ValueError("侧栏宽度必须是数字。")
+        result["sidebar_width"] = max(180, min(420, int(width)))
+    if "sidebar_collapsed" in values:
+        if not isinstance(values["sidebar_collapsed"], bool):
+            raise ValueError("侧栏折叠状态必须是布尔值。")
+        result["sidebar_collapsed"] = values["sidebar_collapsed"]
+    destination = DATA / "workspace-preferences.json"
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    with _lock:
+        DATA.mkdir(parents=True, exist_ok=True)
+        try:
+            temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return result
+
+
 def safe_filename(name: str) -> str:
     name = Path(name or "paper.pdf").name
     name = re.sub(r"[^\w.()\- 一-龥]+", "_", name).strip(" .")
@@ -110,11 +220,24 @@ def safe_filename(name: str) -> str:
 
 
 def _sha256(path: Path) -> str:
+    try:
+        stat = path.stat()
+        key = (str(path.resolve()), int(stat.st_size), int(stat.st_mtime_ns), int(getattr(stat, "st_ctime_ns", 0)))
+        cached = _sha_cache.get(key)
+        if cached:
+            return cached
+    except OSError:
+        key = None
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
-    return digest.hexdigest()
+    value = digest.hexdigest()
+    if key is not None:
+        _sha_cache[key] = value
+        if len(_sha_cache) > 512:
+            _sha_cache.pop(next(iter(_sha_cache)))
+    return value
 
 
 def _atomic_copy(source: Path, destination: Path) -> None:
@@ -199,6 +322,62 @@ def _translation_is_current(job: dict[str, Any]) -> bool:
     if not translated or not bilingual:
         return False
     return meta.get("translated_sha256") == _sha256(translated) and meta.get("bilingual_sha256") == _sha256(bilingual)
+
+
+@pdf_serialized
+def _extract_translated_title(path: Path, fallback: str) -> str:
+    """Read a geometrically credible Chinese title from the first page."""
+    runtime = ROOT / (".runtime311" if sys.version_info[:2] == (3, 11) else ".runtime")
+    if runtime.is_dir() and str(runtime) not in sys.path:
+        sys.path.insert(0, str(runtime))
+    try:
+        try:
+            import pymupdf as fitz
+        except ImportError:
+            import fitz
+        document = fitz.open(str(path))
+        page = document[0]
+        blocks = page.get_text("dict").get("blocks", [])
+        spans = []
+        for block in blocks:
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = re.sub(r"\s+", " ", str(span.get("text") or "")).strip()
+                    chinese = len(re.findall(r"[\u3400-\u9fff]", text))
+                    if not text or chinese < 2 or len(text) > 80:
+                        continue
+                    bbox = span.get("bbox") or (0, 0, 0, page.rect.height)
+                    if float(bbox[1]) > float(page.rect.height) * 0.55:
+                        continue
+                    if re.search(r"(摘要|abstract|关键词|作者|单位|大学|医院|研究院|doi|https?://|\b20\d{2}\b)", text, re.I):
+                        continue
+                    spans.append({"text": text, "size": float(span.get("size") or 0), "x": float(bbox[0]), "y": float(bbox[1])})
+        document.close()
+        if not spans:
+            return fallback
+        largest = max(item["size"] for item in spans)
+        title_spans = [item for item in spans if item["size"] >= max(11.0, largest * 0.78)]
+        title_spans.sort(key=lambda item: (item["y"], item["x"]))
+        candidate = "".join(item["text"] for item in title_spans[:3]).strip()
+        if 2 <= len(re.findall(r"[\u3400-\u9fff]", candidate)) <= 80 and len(candidate) <= 120 and not re.search(r"[。！？；:：]$", candidate):
+            return candidate
+    except Exception:
+        return fallback
+    return fallback
+
+
+def _fill_translation_title(job: dict[str, Any], translated: Path | None = None) -> bool:
+    if job.get("translated_title") or job.get("title_checked"):
+        return False
+    translated = translated or _job_relative_file(job, job.get("translated_file"))
+    if not translated:
+        return False
+    fallback = str(job.get("display_title") or job.get("filename") or "未命名论文")
+    title = _extract_translated_title(translated, fallback)
+    job["translated_title"] = title if title != fallback else None
+    job["display_title"] = title or fallback
+    job["title_checked"] = True
+    return True
 
 
 def _full_translation_paths(job: dict[str, Any]) -> tuple[Path, Path]:
@@ -518,10 +697,16 @@ def parse_pages(value: str, page_count: int) -> str:
 def load_job(job_id: str) -> dict[str, Any] | None:
     with _lock:
         if job_id in _jobs:
-            return dict(_jobs[job_id])
+            result = dict(_jobs[job_id])
+            if result.get("status") == "completed" and _fill_translation_title(result):
+                save_job(result)
+            return result
     path = JOBS / job_id / "job.json"
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        result = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(result, dict) and result.get("status") == "completed" and _fill_translation_title(result):
+            save_job(result)
+        return result
     except (FileNotFoundError, json.JSONDecodeError):
         return None
 
@@ -529,20 +714,50 @@ def load_job(job_id: str) -> dict[str, Any] | None:
 def save_job(job: dict[str, Any]) -> None:
     job_dir = JOBS / job["id"]
     job_dir.mkdir(parents=True, exist_ok=True)
-    (job_dir / "job.json").write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+    destination = job_dir / "job.json"
+    temporary = job_dir / f".job.{uuid.uuid4().hex}.tmp"
+    try:
+        temporary.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
     with _lock:
         _jobs[job["id"]] = dict(job)
+    try:
+        catalog.update(DATA, job)
+    except Exception:
+        # The job JSON is the compatibility source of truth; a transient
+        # index failure must not make an already completed translation fail.
+        pass
 
 
 def list_jobs() -> list[dict[str, Any]]:
     ensure_dirs()
     result = []
-    for path in JOBS.glob("*/job.json"):
-        try:
-            job = json.loads(path.read_text(encoding="utf-8"))
-            result.append({k: job.get(k) for k in ("id", "filename", "created_at", "status", "mode", "page_count", "error", "demo_mode")})
-        except json.JSONDecodeError:
-            continue
+    for row in catalog.list_documents(DATA):
+        if row.get("status") == "completed" and not row.get("translated_title"):
+            # Only legacy rows lacking a title are reopened once; normal list
+            # polling is served entirely from SQLite.
+            job = load_job(str(row.get("job_id")))
+            if job:
+                row["display_title"] = job.get("display_title") or row.get("display_title")
+                row["translated_title"] = job.get("translated_title")
+                _enqueue_markdown_export(job)
+        elif row.get("status") == "completed":
+            _enqueue_markdown_export({
+                "id": row.get("job_id"), "status": "completed", "filename": row.get("filename"),
+                "translated_file": row.get("translated_pdf"), "source_sha256": row.get("source_sha256"),
+                "translated_sha256": row.get("translated_sha256"), "translation_scope": row.get("translation_scope"),
+                "mode": row.get("mode"), "pages": row.get("pages"), "page_count": row.get("page_count"),
+                "demo_mode": bool(row.get("demo_mode")),
+            })
+        result.append({
+            "id": row.get("job_id"), "filename": row.get("filename"),
+            "display_title": row.get("display_title"), "translated_title": row.get("translated_title"),
+            "created_at": row.get("created_at"), "status": row.get("status"),
+            "mode": row.get("mode"), "page_count": row.get("page_count"),
+            "error": row.get("error"), "demo_mode": bool(row.get("demo_mode")),
+        })
     return sorted(result, key=lambda x: x.get("created_at", ""), reverse=True)
 
 
@@ -694,6 +909,7 @@ def _run_babeldoc(job: dict[str, Any], settings: dict[str, Any]) -> tuple[Path, 
     return published_translated, published_bilingual
 
 
+@pdf_serialized
 def _validate_translation_output(source: Path, translated: Path, job: dict[str, Any]) -> None:
     """Reject a PDF that silently lost text-heavy pages during translation."""
     runtime = ROOT / (".runtime311" if os.sys.version_info[:2] == (3, 11) else ".runtime")
@@ -818,6 +1034,7 @@ def _worker(job: dict[str, Any]) -> None:
         if job.get("mode") == "full" and not job.get("demo_mode") and _reuse_full_translation(job):
             translated = JOBS / job["id"] / job["translated_file"]
             bilingual = JOBS / job["id"] / job["bilingual_file"]
+            _fill_translation_title(job, translated)
             warning = _publish_external_full_outputs(job, translated, bilingual)
             if warning:
                 job["message"] = f"{job.get('message', '翻译完成。')} {warning}"
@@ -825,6 +1042,7 @@ def _worker(job: dict[str, Any]) -> None:
             if warning:
                 job["message"] = f"已复用同源全文译文，未再次调用 API。{warning}"
             save_job(job)
+            _enqueue_markdown_export(job)
             return
         settings = read_settings()
         if job["demo_mode"]:
@@ -840,6 +1058,7 @@ def _worker(job: dict[str, Any]) -> None:
         external_warning = _publish_external_full_outputs(job, translated, bilingual) if job.get("mode") == "full" and not job.get("demo_mode") else None
         job["translated_file"] = translated.relative_to(JOBS / job["id"]).as_posix()
         job["bilingual_file"] = bilingual.relative_to(JOBS / job["id"]).as_posix()
+        _fill_translation_title(job, translated)
         job["translation_scope"] = "demo" if job.get("demo_mode") else ("full" if job.get("mode") == "full" else "trial")
         job["translation_reused"] = False
         job["status"] = "completed"
@@ -858,6 +1077,7 @@ def _worker(job: dict[str, Any]) -> None:
     if engine_started:
         _record_engine_usage(job)
     save_job(job)
+    _enqueue_markdown_export(job)
 
 
 def _start_job(job: dict[str, Any]) -> None:
@@ -865,26 +1085,135 @@ def _start_job(job: dict[str, Any]) -> None:
     thread.start()
 
 
+def _enqueue_markdown_export(job: dict[str, Any]) -> None:
+    """Queue Markdown generation after the PDF is durably published."""
+    if job.get("status") != "completed":
+        return
+    if _markdown_export_current(job):
+        return
+    data_root, jobs_root, job_id = DATA, JOBS, str(job.get("id", ""))
+    key = f"{jobs_root.resolve()}::{job_id}"
+    with _lock:
+        if key in _markdown_scheduled:
+            return
+        _markdown_scheduled.add(key)
+
+    def dispatch() -> None:
+        try:
+            from .markdown_export import enqueue_export
+            current_path = jobs_root / job_id / "job.json"
+            try:
+                current = json.loads(current_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                current = dict(job)
+            enqueue_export(data_root, jobs_root, current)
+        except Exception:
+            # Markdown is an auxiliary export; PDF completion remains successful.
+            pass
+        finally:
+            with _lock:
+                _markdown_scheduled.discard(key)
+
+    # Let callers finish their response and tests release temporary folders;
+    # the export remains asynchronous and retries on the next completed/listed job.
+    timer = threading.Timer(2.0, dispatch)
+    timer.daemon = True
+    timer.start()
+
+
+def _markdown_export_current(job: dict[str, Any]) -> bool:
+    """Compare cheap manifest/catalog fields; never hash PDFs while listing."""
+    metadata_path = JOBS / str(job.get("id", "")) / "markdown" / "metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    try:
+        from .markdown_export import CONVERTER_NAME, CONVERTER_VERSION, EXPORT_VERSION, SCHEMA_VERSION
+        if any(metadata.get(key) != value for key, value in {
+            "version": EXPORT_VERSION, "schema_version": SCHEMA_VERSION,
+            "converter": CONVERTER_NAME, "converter_version": CONVERTER_VERSION,
+        }.items()):
+            return False
+    except Exception:
+        return False
+    scope = "demo" if job.get("demo_mode") else str(job.get("translation_scope") or job.get("mode") or "full").lower()
+    if scope not in {"full", "trial", "demo"}:
+        scope = "full"
+    selected: list[int]
+    try:
+        selected = list(range(1, int(job.get("page_count") or 0) + 1)) if scope == "full" or not str(job.get("pages") or "").strip() else []
+        if not selected:
+            for part in str(job.get("pages") or "").split(","):
+                bits = part.strip().split("-", 1)
+                first = int(bits[0]); last = int(bits[1]) if len(bits) == 2 and bits[1] else int(job.get("page_count") or first)
+                selected.extend(range(first, last + 1))
+            selected = sorted(set(selected))
+    except (TypeError, ValueError):
+        return False
+    try:
+        translation_meta = _read_translation_meta(job)
+    except Exception:
+        translation_meta = {}
+    return (
+        metadata.get("source_sha256") == job.get("source_sha256")
+        and metadata.get("translated_sha256") == translation_meta.get("translated_sha256")
+        and metadata.get("scope") == scope
+        and metadata.get("selected_pages") == selected
+        and all((metadata_path.parent / name).is_file() for name in ("source.md", "translated.md"))
+    )
+
+
 def create_job(filename: str, content: bytes, pages: str, mode: str, demo_mode: bool, start_translation: bool = True) -> dict[str, Any]:
     if len(content) > MAX_UPLOAD_BYTES:
         raise ValueError("文件超过 100 MB 限制，请压缩后再试。")
     if not content.startswith(b"%PDF"):
         raise ValueError("上传内容不是有效 PDF 文件。")
-    job_id = uuid.uuid4().hex
-    job_dir = JOBS / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-    source = job_dir / "source.pdf"
-    source.write_bytes(content)
     try:
-        reader = PdfReader(str(source))
+        reader = PdfReader(io.BytesIO(content))
         page_count = len(reader.pages)
         pages = parse_pages(pages, page_count)
     except Exception:
-        shutil.rmtree(job_dir, ignore_errors=True)
         raise ValueError("无法读取 PDF 页数，请确认文件未损坏且未加密。")
+    ensure_dirs()
+    source_sha256 = hashlib.sha256(content).hexdigest()
+    job_id = uuid.uuid4().hex
+    filename_value = safe_filename(filename)
+    existing_id = catalog.claim(DATA, source_sha256, job_id, filename=filename_value, created_at=datetime.now(timezone.utc).isoformat())
+    if existing_id:
+        existing = load_job(existing_id)
+        for _ in range(100):
+            if existing:
+                break
+            # Another importer may have committed the SQLite reservation just
+            # before writing its compatibility JSON job file.
+            time.sleep(0.01)
+            existing = load_job(existing_id)
+        if existing:
+            duplicate = dict(existing)
+            duplicate["duplicate"] = True
+            duplicate["message"] = "已存在相同内容的文献，已返回现有文献，未重复导入或翻译。"
+            return duplicate
+        raise ValueError("相同内容的文献索引指向尚未完成的导入，请稍后重试。")
+    job_dir = JOBS / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    source = job_dir / "source.pdf"
+    try:
+        source.write_bytes(content)
+    except OSError:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        catalog.remove(DATA, job_id)
+        raise
     actual_mode = mode if mode in {"trial", "full"} else "full"
-    job = {"id": job_id, "filename": safe_filename(filename), "created_at": datetime.now(timezone.utc).isoformat(), "status": "queued" if start_translation else "imported", "progress": None, "progress_indeterminate": True, "stage": "queued" if start_translation else "imported", "stage_current": 0, "stage_total": None, "mode": actual_mode, "pages": pages, "page_count": page_count, "demo_mode": bool(demo_mode), "source_sha256": _sha256(source), "translation_scope": None, "translation_reused": False, "error": "", "message": "已导入源 PDF，可先预览或开始翻译。" if not start_translation else ""}
-    save_job(job)
+    job = {"id": job_id, "filename": filename_value, "display_title": filename_value, "created_at": datetime.now(timezone.utc).isoformat(), "status": "queued" if start_translation else "imported", "progress": None, "progress_indeterminate": True, "stage": "queued" if start_translation else "imported", "stage_current": 0, "stage_total": None, "mode": actual_mode, "pages": pages, "page_count": page_count, "demo_mode": bool(demo_mode), "source_sha256": source_sha256, "translation_scope": None, "translation_reused": False, "translated_title": None, "title_checked": False, "error": "", "message": "已导入源 PDF，可先预览或开始翻译。" if not start_translation else "", "markdown": {"source": "markdown/source.md", "translated": "markdown/translated.md", "metadata": "markdown/metadata.json"}}
+    try:
+        save_job(job)
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        catalog.remove(DATA, job_id)
+        raise OSError(f"文献库目录不可写：{DATA}，导入未完成。")
     if start_translation:
         _start_job(job)
     return job
@@ -907,6 +1236,8 @@ def create_job_from_path(path_value: str, pages: str, mode: str, demo_mode: bool
     # Keep native imports stopped until the sidecar/cache decision is made;
     # otherwise create_job would start a worker before we can inspect it.
     job = create_job(candidate.name, candidate.read_bytes(), pages, mode, demo_mode, start_translation=False)
+    if job.get("duplicate"):
+        return job
     job["source_origin"] = "desktop-local"
     save_job(job)
     try:
@@ -915,6 +1246,7 @@ def create_job_from_path(path_value: str, pages: str, mode: str, demo_mode: bool
         job["message"] = "已导入源 PDF，但无法记录原文件位置；翻译结果仍会保存在 job 目录。"
     if job.get("mode") == "full" and not demo_mode and _reuse_external_translation(job, candidate):
         save_job(job)
+        _enqueue_markdown_export(job)
         return job
     if start_translation:
         job["status"] = "queued"
@@ -938,7 +1270,7 @@ def translate_job(job_id: str, mode: str, pages: str, demo_mode: bool) -> dict[s
         raise ValueError("任务正在处理中，请等待当前任务完成。")
     mode = mode if mode in {"trial", "full"} else "full"
     pages = parse_pages(pages if mode == "trial" else "", int(job["page_count"]))
-    job.update({"status": "queued", "progress": None, "progress_indeterminate": True, "stage": "queued", "stage_current": 0, "stage_total": None, "mode": mode, "pages": pages, "demo_mode": bool(demo_mode), "translation_scope": None, "translation_reused": False, "error": "", "message": ""})
+    job.update({"status": "queued", "progress": None, "progress_indeterminate": True, "stage": "queued", "stage_current": 0, "stage_total": None, "mode": mode, "pages": pages, "demo_mode": bool(demo_mode), "translation_scope": None, "translation_reused": False, "translated_title": None, "title_checked": False, "error": "", "message": ""})
     save_job(job)
     _start_job(job)
     return job
@@ -962,6 +1294,31 @@ def file_path(job_id: str, kind: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def save_translation(job_id: str, destination: str | Path) -> Path:
+    """Copy a verified Chinese PDF to a user-selected native destination."""
+    source = file_path(job_id, "translated")
+    if not source:
+        raise FileNotFoundError("中文译文尚未生成。")
+    target = Path(destination).expanduser().resolve(strict=False)
+    if target.suffix.lower() != ".pdf":
+        raise ValueError("保存文件必须是 PDF。")
+    job_dir = (JOBS / job_id).resolve()
+    try:
+        target.relative_to(job_dir)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("不能覆盖文献库内部文件，请选择其他位置。")
+    if target == source.resolve() or target == (JOBS / job_id / "source.pdf").resolve():
+        raise ValueError("不能覆盖文献库内部文件，请选择其他位置。")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_copy(source, target)
+    except OSError as exc:
+        raise OSError(f"中文译文保存失败：{exc}") from exc
+    return target
+
+
 def render_page(job_id: str, kind: str, page_number: int, zoom: int = 100) -> bytes:
     """Render one page for the synchronized reader, using local PyMuPDF."""
     source = file_path(job_id, kind)
@@ -981,6 +1338,15 @@ def render_page(job_id: str, kind: str, page_number: int, zoom: int = 100) -> by
     except ImportError as exc:
         raise RuntimeError("缺少 PyMuPDF，请运行启动脚本自动安装渲染依赖。") from exc
     zoom = max(50, min(200, int(zoom)))
+    return _render_page_pdf(source, page_number, zoom)
+
+
+@pdf_serialized
+def _render_page_pdf(source: Path, page_number: int, zoom: int) -> bytes:
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        import fitz
     document = fitz.open(str(source))
     try:
         page = document.load_page(page_number - 1)

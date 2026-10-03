@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 runtime = ROOT / (".runtime311" if sys.version_info[:2] == (3, 11) else ".runtime")
-runtime_home = Path(os.environ.get("PAPER_TRANSLATOR_DATA_DIR") or ROOT / "data") / "babeldoc-user"
+runtime_home = Path(os.environ.get("PAPER_TRANSLATOR_CACHE_DIR") or (Path(os.environ.get("PAPER_TRANSLATOR_DATA_DIR") or ROOT / "data") / "babeldoc-user"))
 runtime_home.mkdir(parents=True, exist_ok=True)
 # BabelDOC derives its cache from Path.home(). Keep model/font caches with
 # this app instead of writing to a global user profile.

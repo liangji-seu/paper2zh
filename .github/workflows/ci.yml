@@ -32,8 +32,8 @@ jobs:
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 
-      - name: Run reader geometry regression
-        run: node --test tests/reader-geometry.test.mjs
+      - name: Run reader interaction regressions
+        run: node --test tests/reader-geometry.test.mjs tests/pan-interaction.test.mjs
 
       - name: Compile Python modules
         run: python -m py_compile app/security.py app/core.py app/server.py run.py

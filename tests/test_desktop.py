@@ -10,7 +10,7 @@ class DesktopBridgeTests(unittest.TestCase):
         bridge = DesktopBridge()
         bridge._window = object()
         public = {name for name in dir(bridge) if not name.startswith("_")}
-        self.assertEqual(public, {"import_pdf"})
+        self.assertEqual(public, {"import_pdf", "save_translation", "get_workspace_preferences", "save_workspace_preferences"})
 
 
 if __name__ == "__main__":

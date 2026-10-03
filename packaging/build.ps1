@@ -75,6 +75,10 @@ if ($LASTEXITCODE -ne 0) { throw "独立 BabelDOC 引擎自检失败。" }
 
 if (Test-Path -LiteralPath (Join-Path $appDir "data")) { throw "安装包中意外包含用户 data 目录。" }
 if (Test-Path -LiteralPath (Join-Path $internal "data")) { throw "安装包中意外包含用户 data 目录。" }
+if (Test-Path -LiteralPath (Join-Path $appDir "library")) { throw "安装包中意外包含用户 library 目录。" }
+if (Test-Path -LiteralPath (Join-Path $internal "library")) { throw "安装包中意外包含用户 library 目录。" }
+if (Test-Path -LiteralPath (Join-Path $appDir "catalog.db")) { throw "安装包中意外包含用户 catalog.db。" }
+if (Test-Path -LiteralPath (Join-Path $internal "catalog.db")) { throw "安装包中意外包含用户 catalog.db。" }
 $iscc = Join-Path $tools "Inno\ISCC.exe"
 if (-not (Test-Path -LiteralPath $iscc)) {
     $installer = Join-Path $cache "innosetup-7.1.0-x64.exe"

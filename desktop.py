@@ -18,7 +18,16 @@ def resource_root() -> Path:
 
 
 def configure() -> int:
-    data = Path(os.environ.get("PAPER_TRANSLATOR_DATA_DIR") or Path(os.environ["LOCALAPPDATA"]) / "paper2zh")
+    appdata = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "paper2zh"
+    packaged = bool(getattr(sys, "_MEIPASS", None))
+    if packaged:
+        data = Path(sys.executable).resolve().parent / "library"
+        os.environ.setdefault("PAPER_TRANSLATOR_LEGACY_DATA_DIR", str(appdata))
+        os.environ.setdefault("PAPER_TRANSLATOR_SETTINGS_PATH", str(appdata / "settings.json"))
+        os.environ.setdefault("PAPER_TRANSLATOR_CACHE_DIR", str(appdata / "babeldoc-user"))
+    else:
+        data = Path(os.environ.get("PAPER_TRANSLATOR_DATA_DIR") or appdata)
+        os.environ.setdefault("PAPER_TRANSLATOR_SETTINGS_PATH", str(data / "settings.json"))
     data.mkdir(parents=True, exist_ok=True)
     os.environ["PAPER_TRANSLATOR_DATA_DIR"] = str(data)
     engine = resource_root() / "engine" / "python.exe"
@@ -65,7 +74,43 @@ class DesktopBridge:
                 demo_mode=action == "demo",
                 start_translation=action != "import",
             )
-            return {"job": {"id": job["id"]}}
+            return {"job": {"id": job["id"], "duplicate": bool(job.get("duplicate")), "message": job.get("message", "")}}
+        except (ValueError, OSError) as exc:
+            return {"error": str(exc)}
+
+    def save_translation(self, job_id: str) -> dict:
+        """Native Save As for a verified translated PDF only."""
+        import webview
+        from app.core import file_path, load_job, safe_filename, save_translation as save_translation_file
+
+        if self._window is None:
+            return {"error": "桌面窗口尚未就绪。"}
+        if not isinstance(job_id, str) or not job_id:
+            return {"error": "任务 id 无效。"}
+        job = load_job(job_id)
+        if not job or not file_path(job_id, "translated"):
+            return {"error": "中文译文尚未生成。"}
+        title = job.get("translated_title") or job.get("display_title") or job.get("filename") or "paper"
+        if not job.get("translated_title") and str(title).lower().endswith(".pdf"):
+            title = Path(str(title)).stem
+        default_name = safe_filename(f"{title}.zh.pdf")
+        chosen = self._window.create_file_dialog(webview.FileDialog.SAVE, save_filename=default_name, file_types=("中文 PDF (*.pdf)",))
+        if not chosen:
+            return {"cancelled": True}
+        try:
+            saved = save_translation_file(job_id, str(chosen[0]))
+            return {"saved": True, "filename": saved.name}
+        except (ValueError, OSError, FileNotFoundError) as exc:
+            return {"error": str(exc)}
+
+    def get_workspace_preferences(self) -> dict:
+        from app.core import get_workspace_preferences
+        return get_workspace_preferences()
+
+    def save_workspace_preferences(self, values: dict | None = None) -> dict:
+        from app.core import save_workspace_preferences
+        try:
+            return save_workspace_preferences(values if isinstance(values, dict) else {})
         except (ValueError, OSError) as exc:
             return {"error": str(exc)}
 

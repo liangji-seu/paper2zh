@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from . import core
+from .pdf_worker import pdf_serialized
 
 ANNOTATION_TYPES = {"highlight", "underline"}
 ANNOTATION_COLORS = {"#FFE066", "#8CE99A", "#74C0FC", "#FAA2C1"}
@@ -103,6 +104,7 @@ def revision_for(job_id: str, side: str) -> tuple[Path, str]:
     return path, digest.hexdigest()
 
 
+@pdf_serialized
 def _page_bounds(pdf_path: Path, page_number: int) -> tuple[float, float, float, float]:
     fitz = _fitz()
     document = fitz.open(str(pdf_path))
@@ -216,6 +218,11 @@ def export_annotated(job_id: str, side: str) -> tuple[bytes, str]:
     with _lock:
         groups = _read_groups(job_id)
         annotations = list(groups.get(_group_key(side, revision), []))
+    return _export_annotated_pdf(pdf_path, annotations, revision)
+
+
+@pdf_serialized
+def _export_annotated_pdf(pdf_path: Path, annotations: list[dict[str, Any]], revision: str) -> tuple[bytes, str]:
     fitz = _fitz()
     document = fitz.open(str(pdf_path))
     try:

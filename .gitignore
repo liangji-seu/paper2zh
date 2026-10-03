@@ -1,5 +1,6 @@
 # Private local state: credentials, papers, generated translations and jobs
 data/
+library/
 .env
 .env.*
 !.env.example
