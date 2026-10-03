@@ -1,10 +1,10 @@
-# paper2zh 1.0.0（Windows 本地论文阅读与翻译）
+# paper2zh（Windows 本地论文阅读与翻译）
 
 paper2zh 在本机浏览器中管理和阅读 PDF。左侧可按嵌套文件夹整理论文；右侧提供原文、译文和对照视图。导入后即可阅读原文，再决定是否指定页码试译或翻译全文。排版翻译使用 BabelDOC。
 
 ## 安装桌面版
 
-从 [v1.0.0 发布页](https://github.com/liangji-seu/paper2zh/releases/tag/v1.0.0)下载 `paper2zh-Setup-1.0.0-win64.exe`。安装程序默认安装在 `E:\paper2zh`，无需管理员权限；系统需要 Microsoft WebView2 运行时。桌面版附带独立 Python 3.11 与 BabelDOC 依赖，不要求系统安装 Python。首次翻译可能下载模型、字体等资源，请保持网络连接。
+从 [当前公开发布页](https://github.com/liangji-seu/paper2zh/releases/latest)下载 Windows 安装包；源码准备中的版本见 `VERSION`。安装程序默认安装在 `E:\paper2zh`，无需管理员权限；系统需要 Microsoft WebView2 运行时。桌面版附带独立 Python 3.11 与 BabelDOC 依赖，不要求系统安装 Python。首次翻译可能下载模型、字体等资源，请保持网络连接。
 
 桌面版使用系统文件窗口选择 PDF。设置、论文、批注和模型缓存保存在 `%LOCALAPPDATA%\paper2zh`；升级和卸载不会清除这些数据。开发版的 `data/` 不会自动复制到安装版，若需迁移，请先退出两个版本，再备份并复制整个 `data/` 到该用户数据目录。API Key 使用当前 Windows 用户的 DPAPI 加密，只能在同一用户环境解密。安装包不包含用户论文、Key、批注或模型缓存。
 
@@ -38,4 +38,4 @@ BabelDOC 会尽量保留论文的公式、图形与页面结构，但中文长�
 
 ## 构建 Windows 安装包
 
-在 Windows 上用 Python 3.11 执行 `powershell -ExecutionPolicy Bypass -File packaging/build.ps1`。脚本创建隔离构建环境、安装固定版本的桌面壳与翻译引擎、下载并校验官方 Python 3.11.9 嵌入版，再用 PyInstaller 与 Inno Setup 生成 `packaging/output/paper2zh-Setup-1.0.0-win64.exe`。这几个构建目录均被 Git 忽略；网站静态页面在 `docs/`。本地开发机若已有 `.runtime311`，可传 `-UseExistingEngine` 快速预验收，正式构建应使用默认洁净安装流程。
+在 Windows 上用 Python 3.11 执行 `powershell -ExecutionPolicy Bypass -File packaging/build.ps1`。脚本创建隔离构建环境、生成多尺寸应用图标、安装固定版本的桌面壳与翻译引擎、下载并校验官方 Python 3.11.9 嵌入版，再用 PyInstaller 与 Inno Setup 生成 `packaging/output/paper2zh-Setup-<VERSION>-win64.exe`。这些构建目录均被 Git 忽略；网站静态页面在 `docs/`。本地开发机若已有 `.runtime311`，可传 `-UseExistingEngine` 快速预验收，正式构建应使用默认洁净安装流程。

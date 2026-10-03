@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import ctypes
 import socket
 import sys
 import threading
@@ -32,7 +33,9 @@ def configure() -> int:
 
 class DesktopBridge:
     def __init__(self) -> None:
-        self.window = None
+        # pywebview recursively exposes public attributes to JavaScript.
+        # Keep the Window private or it traverses native WinForms/COM objects.
+        self._window = None
 
     def import_pdf(self, options: dict | None = None) -> dict:
         """The only path-based import comes from this native user file selection."""
@@ -40,9 +43,9 @@ class DesktopBridge:
         from app.core import import_job_from_path
 
         options = options if isinstance(options, dict) else {}
-        if self.window is None:
+        if self._window is None:
             return {"error": "桌面窗口尚未就绪。"}
-        chosen = self.window.create_file_dialog(
+        chosen = self._window.create_file_dialog(
             webview.FileDialog.OPEN,
             allow_multiple=False,
             file_types=("PDF 文件 (*.pdf)",),
@@ -76,6 +79,10 @@ def main() -> None:
     from app.server import run
     import webview
 
+    # Keep the taskbar identity stable across upgrades; WinForms uses the ICO
+    # supplied to webview.start for the window, and the EXE embeds the same ICO.
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("paper2zh.desktop")
+
     threading.Thread(target=run, daemon=True, name="paper2zh-local-server").start()
     url = f"http://127.0.0.1:{port}"
     for _ in range(100):
@@ -87,7 +94,7 @@ def main() -> None:
     else:
         raise RuntimeError("本地阅读服务启动失败。")
     bridge = DesktopBridge()
-    bridge.window = webview.create_window(
+    bridge._window = webview.create_window(
         "paper2zh · 论文工作区",
         url,
         js_api=bridge,
@@ -96,7 +103,7 @@ def main() -> None:
         min_size=(920, 600),
         text_select=True,
     )
-    webview.start(gui="edgechromium", private_mode=True)
+    webview.start(gui="edgechromium", icon=str(resource_root() / "static" / "icon.ico"), private_mode=True)
 
 
 if __name__ == "__main__":

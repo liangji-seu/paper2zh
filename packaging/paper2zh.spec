@@ -22,5 +22,5 @@ a = Analysis(
     noarchive=False,
 )
 pyz = PYZ(a.pure)
-exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="paper2zh", console=False)
+exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="paper2zh", console=False, icon=str(root / "static" / "icon.ico"))
 coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="paper2zh")

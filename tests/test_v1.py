@@ -47,7 +47,20 @@ class V1Tests(unittest.TestCase):
         ended_stage = parse_engine_progress("DEBUG event {'type': 'progress_end', 'stage': 'Translate Paragraphs'}")
         self.assertIsNone(ended_stage["progress"])
         self.assertTrue(ended_stage["indeterminate"])
+        prefixed = parse_engine_progress('PAPER_TRANSLATOR_PROGRESS {"type":"progress_update","stage":"Translate","stage_current":1,"stage_total":2,"overall_progress":12.5}')
+        self.assertEqual(prefixed["progress"], 12.5)
         self.assertIsNone(parse_engine_progress("engine is working"))
+
+    def test_engine_output_excludes_debug_pdfs_and_windows_processes_are_hidden(self):
+        output = self.data / "engine-output"
+        output.mkdir()
+        (output / "paper.debug.pdf").write_bytes(b"debug")
+        (output / "paper.mono.pdf").write_bytes(b"mono")
+        (output / "paper.dual.pdf").write_bytes(b"dual")
+        pdfs = core._engine_output_pdfs(output, time.time() - 1)
+        self.assertEqual({path.name for path in pdfs}, {"paper.mono.pdf", "paper.dual.pdf"})
+        with patch.object(core.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True):
+            self.assertEqual(core._hidden_process_kwargs(), {"creationflags": 0x08000000})
 
     def test_full_translation_reuses_matching_manifest_without_api(self):
         job = core.create_job("paper.pdf", self.pdf_bytes(), "", "full", False, start_translation=False)

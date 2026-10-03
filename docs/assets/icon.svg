@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">paper2zh 双页对照图标</title>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="#142C4C"/>
+  <path d="M42 66c0-9 7-16 16-16h46c10 0 17 3 24 10v143c-8-7-16-10-27-10H58c-9 0-16-7-16-16Z" fill="#F4F8FF"/>
+  <path d="M128 60c7-7 14-10 24-10h46c9 0 16 7 16 16v111c0 9-7 16-16 16h-43c-11 0-19 3-27 10Z" fill="#B9F2E8"/>
+  <path d="M128 61v142" fill="none" stroke="#4676A7" stroke-linecap="round" stroke-width="7"/>
+  <path d="m65 150 17-51 17 51m-28-17h22" fill="none" stroke="#245A89" stroke-linecap="round" stroke-linejoin="round" stroke-width="10"/>
+  <path d="M151 105h42m-21-15v22m-17 13c8 19 21 32 40 41m-3-41c-8 19-21 32-40 41" fill="none" stroke="#087D78" stroke-linecap="round" stroke-linejoin="round" stroke-width="9"/>
+</svg>

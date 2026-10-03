@@ -11,6 +11,8 @@ $stage = Join-Path $packaging "stage"
 $tools = Join-Path $packaging "tools"
 $output = Join-Path $packaging "output"
 $venvPython = Join-Path $packaging ".venv\Scripts\python.exe"
+$version = (Get-Content -LiteralPath (Join-Path $repo "VERSION") -Raw -Encoding UTF8).Trim()
+if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "VERSION 格式无效：$version" }
 foreach ($directory in @($cache, $tools, $output)) {
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
 }
@@ -21,8 +23,10 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
 }
 & $venvPython -c "import sys; assert sys.version_info[:2] == (3, 11), 'Build Python must be 3.11'"
 if ($LASTEXITCODE -ne 0) { throw "构建环境必须使用 Python 3.11。" }
-& $venvPython -m pip install -r (Join-Path $repo "requirements.txt") "pywebview==6.2.1" "pyinstaller==6.21.0"
+& $venvPython -m pip install -r (Join-Path $repo "requirements.txt") "pywebview==6.2.1" "pyinstaller==6.21.0" "Pillow==11.3.0"
 if ($LASTEXITCODE -ne 0) { throw "构建依赖安装失败。" }
+& $venvPython (Join-Path $packaging "generate_icon.py")
+if ($LASTEXITCODE -ne 0) { throw "图标生成失败。" }
 
 # The stage is disposable build output. Never touch data/, cached models, or a previous installation.
 $stageFull = [IO.Path]::GetFullPath($stage)
@@ -81,6 +85,6 @@ if (-not (Test-Path -LiteralPath $iscc)) {
     Start-Process -FilePath $installer -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/NOICONS", "/DIR=$(Join-Path $tools 'Inno')") -Wait -WindowStyle Hidden
 }
 if (-not (Test-Path -LiteralPath $iscc)) { throw "Inno Setup 编译器不可用。" }
-& $iscc (Join-Path $packaging "paper2zh.iss")
+& $iscc "/DProductVersion=$version" (Join-Path $packaging "paper2zh.iss")
 if ($LASTEXITCODE -ne 0) { throw "安装包编译失败。" }
-Write-Host "安装包已生成：$(Join-Path $output 'paper2zh-Setup-1.0.0-win64.exe')"
+Write-Host "安装包已生成：$(Join-Path $output "paper2zh-Setup-$version-win64.exe")"

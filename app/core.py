@@ -559,7 +559,7 @@ def _find_babeldoc() -> list[str] | None:
         py_launcher = shutil.which("py")
         if py_launcher:
             try:
-                probe = subprocess.run([py_launcher, "-3.11", "-c", "import sys; raise SystemExit(sys.version_info[:2] != (3, 11))"], capture_output=True, timeout=10)
+                probe = subprocess.run([py_launcher, "-3.11", "-c", "import sys; raise SystemExit(sys.version_info[:2] != (3, 11))"], capture_output=True, timeout=10, **_hidden_process_kwargs())
                 if probe.returncode == 0:
                     return [py_launcher, "-3.11", str(local_launcher)]
             except (OSError, subprocess.SubprocessError):
@@ -576,6 +576,29 @@ def _find_babeldoc() -> list[str] | None:
     return None
 
 
+def _hidden_process_kwargs() -> dict[str, Any]:
+    """Hide bundled Python consoles on Windows while remaining portable."""
+    creation_flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return {"creationflags": creation_flag} if creation_flag else {}
+
+
+def _engine_output_pdfs(output_dir: Path, started_at: float) -> list[Path]:
+    """Return fresh normal outputs and ignore debug/inspection PDFs."""
+    debug_tokens = ("debug", "charbox", "char_box", "show-char-box")
+    candidates = []
+    for path in output_dir.rglob("*.pdf"):
+        lowered = path.name.lower()
+        if any(token in lowered for token in debug_tokens):
+            continue
+        try:
+            if path.stat().st_mtime + 1.0 < started_at:
+                continue
+        except OSError:
+            continue
+        candidates.append(path)
+    return candidates
+
+
 def _run_babeldoc(job: dict[str, Any], settings: dict[str, Any]) -> tuple[Path, Path]:
     command = _find_babeldoc()
     if not command:
@@ -583,6 +606,7 @@ def _run_babeldoc(job: dict[str, Any], settings: dict[str, Any]) -> tuple[Path, 
     job_dir = JOBS / job["id"]
     output_dir = job_dir / "babeldoc-output"
     output_dir.mkdir(exist_ok=True)
+    run_started = time.time()
     (job_dir / "engine.log").write_text("", encoding="utf-8")
     source = job_dir / "source.pdf"
     # BabelDOC documents both CLI and TOML configuration. Keep the secret out
@@ -606,7 +630,7 @@ def _run_babeldoc(job: dict[str, Any], settings: dict[str, Any]) -> tuple[Path, 
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".toml", prefix="paper-translator-", delete=False) as config_file:
             config_file.write(config_text)
             config_path = Path(config_file.name)
-        args = command + ["--files", str(source), "--config", str(config_path), "--debug"]
+        args = command + ["--files", str(source), "--config", str(config_path)]
         if urlparse(settings["base_url"]).hostname == "api.deepseek.com":
             # DeepSeek V4 defaults to thinking mode. Its reasoning can consume
             # the response budget before BabelDOC receives usable text/JSON.
@@ -615,7 +639,7 @@ def _run_babeldoc(job: dict[str, Any], settings: dict[str, Any]) -> tuple[Path, 
             args += ["--pages", job["pages"]]
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
-        process = subprocess.Popen(args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, env=env)
+        process = subprocess.Popen(args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, env=env, **_hidden_process_kwargs())
         lines: queue.Queue[str | None] = queue.Queue()
 
         def read_engine_output() -> None:
@@ -658,7 +682,7 @@ def _run_babeldoc(job: dict[str, Any], settings: dict[str, Any]) -> tuple[Path, 
     details = diagnostic.strip()[-1200:] or "BabelDOC 未返回错误详情"
     if completed.returncode != 0:
         raise RuntimeError(f"BabelDOC 翻译失败：{details}")
-    pdfs = list(output_dir.rglob("*.pdf"))
+    pdfs = _engine_output_pdfs(output_dir, run_started)
     if not pdfs:
         raise RuntimeError(f"BabelDOC 未生成 PDF：{details}")
     bilingual = next((p for p in pdfs if any(s in p.name.lower() for s in ("dual", "bilingual", "双语"))), None)
