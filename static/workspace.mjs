@@ -3,7 +3,7 @@ import {ContinuousReader} from "/static/reader.mjs";
 import {clampMenuPosition,markdownDirectoryFromResult,markdownLocationUrl} from "/static/file-context-menu.mjs";
 pdfjs.GlobalWorkerOptions.workerSrc = "/static/vendor/pdfjs/pdf.worker.mjs";
 const $=id=>document.getElementById(id);
-const state={jobs:[],job:null,file:null,page:1,zoom:100,view:"compare",timer:null,docs:{},annotations:{},cacheJobOrder:[],selection:null,selectedAnnotation:null,undo:null,readerPreserve:true,selectRequest:0,jobsRequest:0,deletedJobIds:new Set(),library:{folders:[],documents:{}},expanded:new Set(),folderEdit:null,movingJob:null,deletingJob:null,deleteInFlight:null};
+const state={jobs:[],job:null,file:null,page:1,zoom:100,view:"compare",timer:null,docs:{},annotations:{},cacheJobOrder:[],selection:null,selectedAnnotation:null,undo:null,readerPreserve:true,selectRequest:0,jobsRequest:0,deletedJobIds:new Set(),library:{folders:[],documents:{}},expanded:new Set(),folderEdit:null,movingJob:null,deletingJob:null,deleteInFlight:null,deletingFolder:null,folderDeleteInFlight:null,folderDeleteRequest:0,draggingJob:null,dragMoveInFlight:null,dragRenderPending:false,dropFolderId:undefined};
 const key=(side,jobId=state.job?.id)=>String(jobId)+":"+side;
 const path=id=>encodeURIComponent(String(id));
 let reader;
@@ -27,8 +27,8 @@ function saveSidebarBridge(){const bridge=window.pywebview?.api;if(typeof bridge
 async function syncSidebarPreferences(){const bridge=window.pywebview?.api;if(typeof bridge?.get_workspace_preferences!=="function")return;try{const prefs=await bridge.get_workspace_preferences();if(Number.isFinite(Number(prefs?.sidebar_width)))sidebarPrefs.width=Number(prefs.sidebar_width);if(typeof prefs?.sidebar_collapsed==="boolean")sidebarPrefs.collapsed=prefs.sidebar_collapsed;setSidebarCollapsed(sidebarPrefs.collapsed,false);applySidebarWidth(sidebarPrefs.width);writePreference(sidebarKeys.width,sidebarPrefs.width);writePreference(sidebarKeys.collapsed,sidebarPrefs.collapsed);requestRenderPage();}catch(_error){}}
 function initSidebar(){const savedWidth=Number(readPreference(sidebarKeys.width,250));sidebarPrefs.collapsed=readPreference(sidebarKeys.collapsed,"false")==="true";sidebarPrefs.width=Number.isFinite(savedWidth)?savedWidth:250;applySidebarWidth(sidebarPrefs.width);setSidebarCollapsed(sidebarPrefs.collapsed,false);const handle=$("sidebar-resizer");handle.addEventListener("pointerdown",startSidebarResize);handle.addEventListener("keydown",adjustSidebarByKeyboard);$("sidebar-toggle").addEventListener("click",event=>{event.stopPropagation();toggleSidebar();});window.addEventListener("pywebviewready",syncSidebarPreferences);syncSidebarPreferences();}
 function msg(id,text,kind=""){if(id==="status"){$("status-text").textContent=text;$("status").className="status"+(kind?" "+kind:"");return;}const el=$(id);el.textContent=text;el.className="msg"+(kind?" "+kind:"");}
-function open(id){const modal=$(id);modal.classList.add("open");if(id==="delete-modal")$("delete-cancel")?.focus?.();if(id==="settings-modal")loadSettings();}
-function close(id){if(id==="delete-modal"&&state.deleteInFlight)return;$(id).classList.remove("open");if(id==="delete-modal")state.deletingJob=null;}
+function open(id){const modal=$(id);modal.classList.add("open");if(id==="delete-modal")$("delete-cancel")?.focus?.();if(id==="folder-delete-modal")$("folder-delete-cancel")?.focus?.();if(id==="settings-modal")loadSettings();}
+function close(id){if(id==="delete-modal"&&state.deleteInFlight)return;if(id==="folder-delete-modal"&&state.folderDeleteInFlight)return;$(id).classList.remove("open");if(id==="delete-modal")state.deletingJob=null;if(id==="folder-delete-modal")state.deletingFolder=null;}
 async function api(url,options={}){const headers=new Headers(options.headers||{});if(options.method&&options.method!=="GET")headers.set("X-Paper-Translator","1");const response=await fetch(url,{...options,headers});const data=await response.json();if(!response.ok)throw Error(data.error||"请求失败");return data;}
 function post(url,data){return api(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});}
 function label(job){if(job.status==="completed")return job.demo_mode?"演示完成":"翻译完成";if(job.status==="failed")return "失败";if(job.status==="running")return "翻译中";if(job.status==="queued")return "等待处理";return "已导入";}
@@ -40,6 +40,19 @@ function folderModal(action,id=null,parent=null){state.folderEdit={action,id};co
 async function submitFolder(){const edit=state.folderEdit;if(!edit)return;const name=$("folder-name").value.trim(),parent_id=$("folder-parent").value||null;if(edit.action!=="move_folder"&&!name){msg("folder-msg","请输入文件夹名称。","error");return;}const payload={action:edit.action};if(edit.action==="create_folder")Object.assign(payload,{name,parent_id});else if(edit.action==="rename_folder")Object.assign(payload,{id:edit.id,name});else Object.assign(payload,{id:edit.id,parent_id});try{state.library=await post("/api/library",payload);if(edit.action==="create_folder")for(const folder of state.library.folders)if(folder.name===name&&folder.parent_id===parent_id)state.expanded.add(folder.id);close("folder-modal");renderList();}catch(error){msg("folder-msg",error.message,"error");}}
 function moveDocument(job){state.movingJob=job;$("move-name").textContent=job.filename;folderOptions($("move-destination"),state.library.documents?.[job.id]||null);msg("move-msg","");open("move-modal");}
 async function submitMove(){if(!state.movingJob)return;try{state.library=await post("/api/library",{action:"move_document",job_id:state.movingJob.id,folder_id:$("move-destination").value||null});close("move-modal");renderList();}catch(error){msg("move-msg",error.message,"error");}}
+function folderForId(id){return state.library.folders?.find(folder=>String(folder.id)===String(id))||null;}
+function deleteFolder(folder){if(!folder?.id||state.folderDeleteInFlight||$("folder-delete-modal").classList.contains("open"))return;state.deletingFolder={id:folder.id,name:folder.name||"未命名文件夹",parent_id:folder.parent_id??null};$("folder-delete-name").textContent=state.deletingFolder.name;msg("folder-delete-msg","");open("folder-delete-modal");}
+async function submitFolderDelete(){const folder=state.deletingFolder;if(!folder?.id||state.folderDeleteInFlight)return;const button=$("submit-folder-delete"),request=++state.folderDeleteRequest;state.folderDeleteInFlight=String(folder.id);button.disabled=true;msg("folder-delete-msg","正在删除分类…");try{const result=await post("/api/library",{action:"delete_folder",id:folder.id});if(request!==state.folderDeleteRequest||state.deletingFolder?.id!==folder.id)return;state.library=result?.library||result;const activeIds=new Set((state.library.folders||[]).map(item=>String(item.id)));for(const id of [...state.expanded])if(!activeIds.has(String(id)))state.expanded.delete(id);const parent=folder.parent_id??null;if(parent!==null)state.expanded.add(parent);state.deletingFolder=null;state.folderDeleteInFlight=null;close("folder-delete-modal");renderList();}catch(error){if(request===state.folderDeleteRequest)msg("folder-delete-msg",error.message||"删除分类失败","error");}finally{if(request===state.folderDeleteRequest){state.folderDeleteInFlight=null;button.disabled=false;}}}
+function knownDraggedJob(){const id=state.draggingJob?.id;if(id==null||isDeletedJob(id))return null;return state.jobs.find(job=>String(job.id)===String(id))||null;}
+function clearDropTarget(){document.querySelectorAll(".drop-target").forEach(node=>node.classList.remove("drop-target"));state.dropFolderId=undefined;}
+function clearDocumentDrag({render=true}={}){state.draggingJob=null;clearDropTarget();document.querySelectorAll(".dragging").forEach(node=>node.classList.remove("dragging"));if(render&&state.dragRenderPending){state.dragRenderPending=false;renderList();}}
+function startDocumentDrag(event,job){if(!job?.id||state.dragMoveInFlight||!state.jobs.some(item=>String(item.id)===String(job.id))||isDeletedJob(job.id))return;state.draggingJob={id:job.id};state.dragRenderPending=false;event.dataTransfer?.setData?.("application/x-paper2zh-job",String(job.id));event.dataTransfer?.setData?.("text/plain",String(job.id));if(event.dataTransfer)event.dataTransfer.effectAllowed="move";event.currentTarget?.classList?.add("dragging");}
+function canHandleDocumentDrop(event){const job=knownDraggedJob();if(!job)return false;const types=event?.dataTransfer?.types;if(types?.length&&!Array.from(types).includes("application/x-paper2zh-job"))return false;return true;}
+function documentDragOver(event,folderId,target){if(!canHandleDocumentDrop(event))return;event.preventDefault();event.stopPropagation();if(event.dataTransfer)event.dataTransfer.dropEffect="move";if(state.dropFolderId!==folderId){clearDropTarget();state.dropFolderId=folderId;target.classList.add("drop-target");}else target.classList.add("drop-target");}
+function documentDragLeave(event,target){if(!target.contains(event.relatedTarget)){target.classList.remove("drop-target");if(String(state.dropFolderId??"")===String(target.dataset.folderId??""))state.dropFolderId=undefined;}}
+async function moveDocumentByDrag(folderId,target){const job=knownDraggedJob();if(!job||state.dragMoveInFlight)return;const currentFolder=state.library.documents?.[job.id]??null;const sameFolder=currentFolder===null&&folderId===null||currentFolder!==null&&folderId!==null&&String(currentFolder)===String(folderId);if(sameFolder){clearDocumentDrag();return;}state.dragMoveInFlight=String(job.id);clearDropTarget();try{const result=await post("/api/library",{action:"move_document",job_id:job.id,folder_id:folderId??null});state.library=result?.library||result;if(folderId!==null)state.expanded.add(folderId);const pending=state.dragRenderPending;clearDocumentDrag();if(!pending)renderList();}catch(error){clearDocumentDrag();showFileToast(error.message||"移动论文失败","error");}finally{state.dragMoveInFlight=null;}}
+function documentDrop(event,folderId,target){if(!canHandleDocumentDrop(event))return;event.preventDefault();event.stopPropagation();target.classList.remove("drop-target");moveDocumentByDrag(folderId,target);}
+function bindDocumentDropTarget(target,folderId){target.dataset.folderId=folderId===null?"":String(folderId);target.addEventListener("dragover",event=>documentDragOver(event,folderId,target));target.addEventListener("dragenter",event=>documentDragOver(event,folderId,target));target.addEventListener("dragleave",event=>documentDragLeave(event,target));target.addEventListener("drop",event=>documentDrop(event,folderId,target));}
 const uiIcons={
   file:'<svg viewBox="0 0 16 16" focusable="false"><path d="M3.5 1.75h5.25L12.5 5.5v8.75h-9z"/><path d="M8.75 1.75V5.5h3.75"/><path d="M5.5 8h5M5.5 10.5h5"/></svg>',
   folder:'<svg viewBox="0 0 16 16" focusable="false"><path d="M1.75 4.5h4l1.25 1.5h7.25v7.75h-12.5z"/><path d="M1.75 4.5V3.25h4l1.25 1.25"/></svg>',
@@ -64,7 +77,78 @@ function deleteDocument(job){if(!job?.id||isDeletedJob(job.id)||state.deleteInFl
 function clearDeletedJob(jobId){const id=String(jobId),oldJobs=state.jobs.slice(),deletedIndex=oldJobs.findIndex(job=>String(job.id)===id),deletingCurrent=state.job?.id!=null&&String(state.job.id)===id;state.deletedJobIds.add(id);state.jobsRequest++;state.selectRequest++;if(deletingCurrent&&state.timer){clearTimeout(state.timer);state.timer=null;}state.jobs=oldJobs.filter(job=>String(job.id)!==id);for(const cacheKey of Object.keys(state.docs)){if(cacheKey.startsWith(id+":"))disposeDocument(cacheKey);}for(const cacheKey of Object.keys(state.annotations)){if(cacheKey.startsWith(id+":"))delete state.annotations[cacheKey];}state.cacheJobOrder=state.cacheJobOrder.filter(cacheId=>String(cacheId)!==id);const deletedSelection=state.selection?.jobId!=null&&String(state.selection.jobId)===id;if(deletedSelection){state.selection=null;$("annotation-menu").classList.remove("open");}if(state.selectedAnnotation?.jobId!=null&&String(state.selectedAnnotation.jobId)===id)state.selectedAnnotation=null;if(state.undo?.jobId!=null&&String(state.undo.jobId)===id)state.undo=null;if(deletingCurrent){reader?.destroy();state.job=null;state.page=1;state.zoom=100;$("empty").hidden=false;$("pages").hidden=true;$("title").textContent="选择一篇论文";$("notice").textContent="";$("notice").classList.remove("show");$("progress-wrap").hidden=true;$("progress-stage").textContent="正在准备";$("progress-value").textContent="处理中";$("progress-fill").style.width="";$("token-usage").textContent="Token 未统计";$("status-text").textContent="就绪";$("page-number").value=1;$("total").textContent="—";$("zoom-label").textContent="100%";$("open-translate").disabled=true;$("open-download").disabled=true;const next=state.jobs[deletedIndex]||state.jobs[deletedIndex-1];return next?.id??null;}renderList();return null;}
 async function submitDelete(){const job=state.deletingJob;if(!job?.id||isDeletedJob(job.id)||state.deleteInFlight)return;const button=$("submit-delete");state.deleteInFlight=String(job.id);button.disabled=true;msg("delete-msg","正在移除文献库副本…");try{const result=await post("/api/jobs/"+path(job.id)+"/delete",{});const nextId=clearDeletedJob(job.id);state.deletingJob=null;state.deleteInFlight=null;close("delete-modal");state.library=result.library||await api("/api/library");await loadJobs(false);if(!state.job&&state.jobs.length)await select(nextId&&state.jobs.some(item=>String(item.id)===String(nextId))?nextId:state.jobs[0].id);renderList();msg("status","已从文献库移除，软件托管文件和记录已清理，外部原始 PDF 未删除。");}catch(error){msg("delete-msg",error.message||"删除失败","error");}finally{state.deleteInFlight=null;button.disabled=false;}}
 async function runFileMenuAction(action){const job=fileMenuJob;closeFileMenu();if(!job)return;if(action==="move"){moveDocument(job);return;}if(action==="delete"){deleteDocument(job);return;}if(action!=="copy-markdown")return;try{await copyMarkdownDirectory(job);showFileToast("Markdown 目录地址已复制");}catch(error){showFileToast(error.message||"目录地址复制失败","error");}}
-function renderList(){if(fileMenuJob)closeFileMenu(false);const box=$("files");box.replaceChildren();const folders=state.library.folders||[],mapping=state.library.documents||{},jobs=state.jobs.filter(job=>!isDeletedJob(job.id));const addJob=(job,depth)=>{const row=document.createElement("div");row.className="file-row";row.style.paddingLeft=(5+depth*14)+"px";const button=document.createElement("button");button.className="file"+(state.job?.id===job.id?" active":"");const name=document.createElement("strong");name.append(iconSvg("file"),document.createTextNode(job.translated_title||job.display_title||job.filename||"未命名论文"));name.title=job.filename||"";const meta=document.createElement("small");meta.textContent=label(job)+" · "+(job.page_count||"?")+" 页";button.title=job.filename||"";button.append(name,meta);button.addEventListener("click",()=>{closeFileMenu(false);select(job.id);});button.addEventListener("contextmenu",event=>openFileMenu(event,job,button));button.addEventListener("keydown",event=>{if((event.key==="ContextMenu")||(event.shiftKey&&event.key==="F10")){event.preventDefault();openFileMenu(event,job,button);}});const menuButton=document.createElement("button");menuButton.className="file-menu-trigger";menuButton.type="button";menuButton.title="更多论文操作";menuButton.setAttribute("aria-label","打开论文操作菜单");menuButton.append(iconSvg("more"));menuButton.addEventListener("click",event=>openFileMenu(event,job,menuButton));menuButton.addEventListener("keydown",event=>{if(event.key==="ContextMenu"||(event.shiftKey&&event.key==="F10")){event.preventDefault();openFileMenu(event,job,menuButton);}});row.append(button,menuButton);box.append(row);};const walk=(parent,depth)=>{for(const folder of folders.filter(f=>f.parent_id===parent)){const row=document.createElement("div");row.className="folder-row";row.style.paddingLeft=(5+depth*14)+"px";const toggle=document.createElement("button");toggle.className="folder-toggle";toggle.append(iconSvg(state.expanded.has(folder.id)?"chevron-down":"chevron-right"),iconSvg("folder"),document.createTextNode(folder.name));toggle.title=folder.name;toggle.setAttribute("aria-expanded",String(state.expanded.has(folder.id)));toggle.addEventListener("click",()=>{state.expanded.has(folder.id)?state.expanded.delete(folder.id):state.expanded.add(folder.id);renderList();});row.append(toggle);for(const [title,icon,action] of [["新建子文件夹","plus","create_folder"],["重命名","edit","rename_folder"],["移动文件夹","folder","move_folder"]]){const button=document.createElement("button");button.className="folder-action";button.title=title;button.setAttribute("aria-label",title);button.append(iconSvg(icon));button.addEventListener("click",()=>folderModal(action,folder.id,action==="create_folder"?folder.id:null));row.append(button);}box.append(row);if(state.expanded.has(folder.id)){walk(folder.id,depth+1);for(const job of jobs.filter(j=>mapping[j.id]===folder.id))addJob(job,depth+1);}}};walk(null,0);for(const job of jobs.filter(j=>!mapping[j.id]))addJob(job,0);if(!folders.length&&!jobs.length){const empty=document.createElement("div");empty.className="files-empty";empty.textContent="还没有论文。";box.append(empty);}}
+function renderList(){
+  if(state.draggingJob){state.dragRenderPending=true;return;}
+  if(fileMenuJob)closeFileMenu(false);
+  const box=$("files");box.replaceChildren();
+  const folders=state.library.folders||[],mapping=state.library.documents||{},jobs=state.jobs.filter(job=>!isDeletedJob(job.id));
+  const rootTarget=document.createElement("div");
+  rootTarget.className="library-root-drop";
+  rootTarget.textContent="根目录（拖到这里放回）";
+  rootTarget.setAttribute("role","button");
+  rootTarget.setAttribute("aria-label","根目录，拖到这里放回论文");
+  bindDocumentDropTarget(rootTarget,null);
+  box.append(rootTarget);
+  const addJob=(job,depth)=>{
+    const row=document.createElement("div");
+    row.className="file-row";
+    row.style.paddingLeft=(5+depth*14)+"px";
+    row.draggable=true;
+    const button=document.createElement("button");
+    button.className="file"+(state.job?.id===job.id?" active":"");
+    const name=document.createElement("strong");
+    name.append(iconSvg("file"),document.createTextNode(job.translated_title||job.display_title||job.filename||"未命名论文"));
+    name.title=job.filename||"";
+    const meta=document.createElement("small");
+    meta.textContent=label(job)+" · "+(job.page_count||"?")+" 页";
+    button.title=job.filename||"";
+    button.append(name,meta);
+    button.addEventListener("click",()=>{closeFileMenu(false);select(job.id);});
+    button.addEventListener("contextmenu",event=>openFileMenu(event,job,button));
+    button.addEventListener("keydown",event=>{if((event.key==="ContextMenu")||(event.shiftKey&&event.key==="F10")){event.preventDefault();openFileMenu(event,job,button);}});
+    const menuButton=document.createElement("button");
+    menuButton.className="file-menu-trigger";
+    menuButton.type="button";
+    menuButton.title="更多论文操作";
+    menuButton.setAttribute("aria-label","打开论文操作菜单");
+    menuButton.append(iconSvg("more"));
+    menuButton.addEventListener("click",event=>openFileMenu(event,job,menuButton));
+    menuButton.addEventListener("keydown",event=>{if(event.key==="ContextMenu"||(event.shiftKey&&event.key==="F10")){event.preventDefault();openFileMenu(event,job,menuButton);}});
+    row.addEventListener("dragstart",event=>startDocumentDrag(event,job));
+    row.addEventListener("dragend",()=>clearDocumentDrag());
+    row.append(button,menuButton);
+    box.append(row);
+  };
+  const walk=(parent,depth)=>{
+    for(const folder of folders.filter(f=>f.parent_id===parent)){
+      const row=document.createElement("div");
+      row.className="folder-row";
+      row.style.paddingLeft=(5+depth*14)+"px";
+      const toggle=document.createElement("button");
+      toggle.className="folder-toggle";
+      toggle.append(iconSvg(state.expanded.has(folder.id)?"chevron-down":"chevron-right"),iconSvg("folder"),document.createTextNode(folder.name));
+      toggle.title=folder.name;
+      toggle.setAttribute("aria-expanded",String(state.expanded.has(folder.id)));
+      toggle.addEventListener("click",()=>{state.expanded.has(folder.id)?state.expanded.delete(folder.id):state.expanded.add(folder.id);renderList();});
+      row.append(toggle);
+      bindDocumentDropTarget(row,folder.id);
+      for(const [title,icon,action] of [["新建子文件夹","plus","create_folder"],["重命名","edit","rename_folder"],["移动文件夹","folder","move_folder"],["删除文件夹","trash","delete_folder"]]){
+        const button=document.createElement("button");
+        button.className="folder-action";
+        button.title=title;
+        button.setAttribute("aria-label",title);
+        button.append(iconSvg(icon));
+        button.addEventListener("click",event=>{event.stopPropagation();if(action==="delete_folder")deleteFolder(folder);else folderModal(action,folder.id,action==="create_folder"?folder.id:null);});
+        row.append(button);
+      }
+      box.append(row);
+      if(state.expanded.has(folder.id)){walk(folder.id,depth+1);for(const job of jobs.filter(j=>String(mapping[j.id])===String(folder.id)))addJob(job,depth+1);}
+    }
+  };
+  walk(null,0);
+  for(const job of jobs.filter(j=>!mapping[j.id]))addJob(job,0);
+  if(!folders.length&&!jobs.length){const empty=document.createElement("div");empty.className="files-empty";empty.textContent="还没有论文。";box.append(empty);}
+}
 async function loadJobs(selectFirst=true){const request=++state.jobsRequest;try{const data=await api("/api/jobs");if(request!==state.jobsRequest)return;state.jobs=(data.jobs||[]).filter(job=>!isDeletedJob(job.id));renderList();if(selectFirst&&!state.job&&state.jobs.length)await select(state.jobs[0].id);}catch(error){if(request===state.jobsRequest)msg("status",error.message,"error");}}
 async function select(id){if(isDeletedJob(id))return;const request=++state.selectRequest;try{const job=await api("/api/jobs/"+path(id));if(request!==state.selectRequest||isDeletedJob(id)||isDeletedJob(job.id))return;const previousJobId=state.job?.id;if(previousJobId&&previousJobId!==job.id)reader?.destroy();state.job=job;touchCacheJob(job.id);trimJobCaches();state.page=1;state.zoom=100;state.view="compare";state.readerPreserve=false;state.selection=null;state.selectedAnnotation=null;state.undo=null;$("sidebar").classList.remove("open");renderList();showJob();poll();}catch(error){if(request===state.selectRequest&&!isDeletedJob(id))msg("status",error.message,"error");}}
 function updateProgress(job){const active=job.status==="queued"||job.status==="running",wrap=$("progress-wrap"),value=$("progress-value"),fill=$("progress-fill");$("open-download").disabled=active||!hasTranslation(job);wrap.hidden=!active;if(!active)return;const number=Number(job.progress),known=Number.isFinite(number)&&job.progress!==null&&!job.progress_indeterminate;wrap.classList.toggle("indeterminate",!known);fill.style.width=known?Math.max(0,Math.min(100,number))+"%":"";$("progress-stage").textContent=job.message||({queued:"等待处理",running:"正在翻译"}[job.status]||"处理中");value.textContent=known?Math.round(number)+"%":"处理中";}
@@ -110,5 +194,6 @@ document.addEventListener("keydown",event=>{if(event.code!=="Space"||event.isCom
 document.querySelectorAll("[data-view]").forEach(b=>b.addEventListener("click",()=>{state.view=b.dataset.view;document.querySelectorAll("[data-view]").forEach(x=>x.classList.toggle("active",x===b));renderPage();}));$("prev").addEventListener("click",()=>page(-1));$("next").addEventListener("click",()=>page(1));$("page-number").addEventListener("change",()=>{const target=Math.min(Math.max(1,Number($("page-number").value)||1),Number(state.job?.page_count)||1);if(reader)reader.goToPage(target);else{state.page=target;renderPage();}});$("zoom-out").addEventListener("click",()=>zoom(-10));$("zoom-in").addEventListener("click",()=>zoom(10));
 document.querySelectorAll("[data-color]").forEach(button=>button.addEventListener("click",()=>addAnnotation("highlight",button.dataset.color)));$("annotation-underline").addEventListener("click",()=>addAnnotation("underline","#FFE066"));$("annotation-delete").addEventListener("click",()=>deleteAnnotation(state.selectedAnnotation));$("annotation-undo").addEventListener("click",()=>deleteAnnotation(state.undo));
 $("scroll").addEventListener("wheel",event=>{if(!event.ctrlKey||!state.job)return;event.preventDefault();zoom(event.deltaY<0?10:-10);},{passive:false});window.addEventListener("resize",()=>{applySidebarWidth(sidebarPrefs.width);if(!state.job)return;if(resizeTimer)clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{resizeTimer=0;requestRenderPage();},120);});
+$("submit-folder-delete").addEventListener("click",submitFolderDelete);
 initSidebar();reader=new ContinuousReader({scroller:$("scroll"),pages:$("pages"),getDocument:documentFor,getAnnotations:annotationsFor,onPageChange:pageNumber=>{state.page=pageNumber;$("page-number").value=pageNumber;},onSelection:handleReaderSelection,onSelectionError:handleReaderSelectionError,onAnnotationClick:handleReaderAnnotationClick,onError:error=>msg("status",error,"error")});
 importOptions();translateOptions();loadSettings();loadLibrary().then(loadJobs);

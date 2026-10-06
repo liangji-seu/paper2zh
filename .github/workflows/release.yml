@@ -70,7 +70,7 @@ jobs:
           node --check static/workspace.mjs
           node --check static/reader.mjs
           node --check static/reader-geometry.mjs
-          node --test tests/reader-geometry.test.mjs tests/pan-interaction.test.mjs tests/file-context-menu.test.mjs
+          node --test tests/reader-geometry.test.mjs tests/pan-interaction.test.mjs tests/file-context-menu.test.mjs tests/library-drag-folder.test.mjs
 
       - name: Build Windows installer
         shell: pwsh

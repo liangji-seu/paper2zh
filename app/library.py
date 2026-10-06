@@ -77,7 +77,7 @@ def _parent(value: Any) -> str | None:
 def _check_parent(folder_id: str | None, parent_id: str | None, folders: dict[str, dict[str, Any]]) -> None:
     if parent_id is None:
         return
-    if parent_id not in folders:
+    if not isinstance(parent_id, str) or parent_id not in folders:
         raise ValueError("父文件夹不存在。")
     if folder_id is None:
         return
@@ -89,7 +89,10 @@ def _check_parent(folder_id: str | None, parent_id: str | None, folders: dict[st
         if current in seen:
             raise ValueError("文件夹层级已形成循环。")
         seen.add(current)
-        current = folders[current].get("parent_id")
+        current_parent = folders[current].get("parent_id")
+        if current_parent is not None and (not isinstance(current_parent, str) or current_parent not in folders):
+            raise ValueError("父文件夹不存在。")
+        current = current_parent
 
 
 def _check_job(job_id: Any) -> str:
@@ -138,6 +141,19 @@ def apply_action(payload: dict[str, Any]) -> dict[str, Any]:
             parent_id = _parent(payload.get("parent_id"))
             _check_parent(folder_id, parent_id, folders)
             folders[folder_id]["parent_id"] = parent_id
+        elif action == "delete_folder":
+            folder_id = payload.get("id")
+            if not isinstance(folder_id, str) or folder_id not in folders:
+                raise ValueError("文件夹不存在。")
+            parent_id = folders[folder_id].get("parent_id")
+            _check_parent(folder_id, parent_id, folders)
+            state["folders"] = [item for item in state["folders"] if item.get("id") != folder_id]
+            for item in state["folders"]:
+                if item.get("parent_id") == folder_id:
+                    item["parent_id"] = parent_id
+            for job_id, mapped_folder_id in state["documents"].items():
+                if mapped_folder_id == folder_id:
+                    state["documents"][job_id] = parent_id
         elif action == "move_document":
             job_id = _check_job(payload.get("job_id"))
             folder_id = _parent(payload.get("folder_id"))
@@ -161,6 +177,6 @@ def apply_action(payload: dict[str, Any]) -> dict[str, Any]:
                 raise
             return get_library()
         else:
-            raise ValueError("action 必须是 create_folder、rename_folder、move_folder、delete_document。")
+            raise ValueError("action 必须是 create_folder、rename_folder、move_folder、delete_folder、delete_document。")
         _write(state)
         return get_library()
