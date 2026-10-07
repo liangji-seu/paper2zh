@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import ctypes
+import re
 import socket
 import sys
 import threading
@@ -152,38 +153,78 @@ class DesktopBridge:
         # pywebview recursively exposes public attributes to JavaScript.
         # Keep the Window private or it traverses native WinForms/COM objects.
         self._window = None
+        self._import_lock = threading.Lock()
+
+    @staticmethod
+    def _import_error(exc: Exception) -> str:
+        """Keep per-file errors useful without echoing local paths."""
+        message = str(exc).strip()
+        if not message:
+            return "导入失败。"
+        # Core errors are normally already user-facing. Redact path-shaped
+        # fragments in case a platform/library error includes a local path.
+        message = re.sub(r"[A-Za-z]:[\\/][^;，。；]+", "[本地路径]", message)
+        message = re.sub(r"(?<![A-Za-z0-9])[\\/]{2}[^;，。；]+", "[本地路径]", message)
+        return message
 
     def import_pdf(self, options: dict | None = None) -> dict:
         """The only path-based import comes from this native user file selection."""
-        import webview
-        from app.core import import_job_from_path
-
         options = options if isinstance(options, dict) else {}
-        if self._window is None:
-            return {"error": "桌面窗口尚未就绪。"}
-        chosen = self._window.create_file_dialog(
-            webview.FileDialog.OPEN,
-            allow_multiple=False,
-            file_types=("PDF 文件 (*.pdf)",),
-        )
-        if not chosen:
-            return {"cancelled": True}
         mode = options.get("mode", "full")
         pages = options.get("pages", "")
         action = options.get("action", "import")
         if mode not in {"trial", "full"} or action not in {"import", "translate", "demo"} or not isinstance(pages, str):
             return {"error": "导入选项无效。"}
+        if self._window is None:
+            return {"error": "桌面窗口尚未就绪。"}
+        if not self._import_lock.acquire(blocking=False):
+            return {"error": "已有导入正在进行，请稍候。"}
         try:
-            job = import_job_from_path(
-                str(chosen[0]),
-                mode="full" if action == "import" else mode,
-                pages=pages if mode == "trial" and action != "import" else "",
-                demo_mode=action == "demo",
-                start_translation=action != "import",
+            import webview
+            from app.core import import_job_from_path
+
+            chosen = self._window.create_file_dialog(
+                webview.FileDialog.OPEN,
+                allow_multiple=True,
+                file_types=("PDF 文件 (*.pdf)",),
             )
-            return {"job": {"id": job["id"], "duplicate": bool(job.get("duplicate")), "message": job.get("message", "")}}
+            if not chosen:
+                return {"cancelled": True}
+            paths = tuple(path for path in chosen if isinstance(path, str) and path)
+            if not paths:
+                return {"error": "文件选择结果无效。"}
+            if len(paths) > 1 and action != "import":
+                return {"error": "批量导入请使用‘仅导入，稍后翻译’，导入并翻译/演示暂仅支持单篇"}
+
+            if len(paths) == 1:
+                job = import_job_from_path(
+                    paths[0],
+                    mode="full" if action == "import" else mode,
+                    pages=pages if mode == "trial" and action != "import" else "",
+                    demo_mode=action == "demo",
+                    start_translation=action != "import",
+                )
+                return {"job": {"id": job["id"], "duplicate": bool(job.get("duplicate")), "message": job.get("message", "")}}
+
+            results = []
+            for path in paths:
+                filename = Path(path).name
+                try:
+                    job = import_job_from_path(path, mode="full", pages="", demo_mode=False, start_translation=False)
+                except Exception as exc:
+                    results.append({"filename": filename, "error": self._import_error(exc)})
+                else:
+                    duplicate = bool(job.get("duplicate"))
+                    results.append({
+                        "filename": filename,
+                        "job": {"id": job["id"], "duplicate": duplicate, "message": job.get("message", "")},
+                        "duplicate": duplicate,
+                    })
+            return {"results": results, "total": len(paths)}
         except (ValueError, OSError) as exc:
             return {"error": str(exc)}
+        finally:
+            self._import_lock.release()
 
     def save_translation(self, job_id: str) -> dict:
         """Native Save As for a verified translated PDF only."""

@@ -8,7 +8,7 @@ paper2zh 在本机浏览器中管理和阅读 PDF。左侧可按嵌套文件夹�
 
 ## 安装桌面版
 
-从 [当前公开发布页](https://github.com/liangji-seu/paper2zh/releases/latest)下载 Windows 安装包；当前源码版本为 `v1.1.3`（版本号见 `VERSION`）。安装程序默认安装在 `E:\paper2zh`，无需管理员权限；系统需要 Microsoft WebView2 运行时。桌面版附带独立 Python 3.11 与 BabelDOC 依赖，不要求系统安装 Python。首次翻译可能下载模型、字体等资源，请保持网络连接。
+从 [当前公开发布页](https://github.com/liangji-seu/paper2zh/releases/latest)下载 Windows 安装包；当前源码版本为 `v1.1.4`。安装程序默认安装在 `E:\paper2zh`，无需管理员权限；系统需要 Microsoft WebView2 运行时。桌面版附带独立 Python 3.11 与 BabelDOC 依赖，不要求系统安装 Python。首次翻译可能下载模型、字体等资源，请保持网络连接。
 
 桌面版使用系统文件窗口选择 PDF。文献、译文、批注及 SQLite 索引保存在安装目录的 `library/` 中，默认路径为 `E:\paper2zh\library`。升级后首次打开会复制旧 `%LOCALAPPDATA%\paper2zh` 中的文献与文件夹记录，旧目录保留。API 配置和已有模型缓存继续使用原用户目录；API Key 由当前 Windows 用户的 DPAPI 加密。安装包不包含用户论文、数据库、Markdown、Key、批注或模型缓存。源码开发版继续使用独立的 `data/`。
 
@@ -28,7 +28,7 @@ paper2zh 在本机浏览器中管理和阅读 PDF。左侧可按嵌套文件夹�
 
 ## 阅读与批注
 
-- 左侧可新建多级文件夹、展开或收起、重命名、移动或删除文件夹；删除文件夹时，其中的文献和子文件夹会移到上一级，文献文件和内容都会保留。论文可通过右键或操作菜单移动，也可以直接拖到文件夹或根目录。导入 PDF 时可仅导入、导入后翻译或运行不调用 API 的演示流程。
+- 左侧可新建多级文件夹、展开或收起、重命名、移动或删除文件夹；删除文件夹时，其中的文献和子文件夹会移到上一级，文献文件和内容都会保留。论文可通过右键或操作菜单移动，也可以直接拖到文件夹或根目录。导入 PDF 时可仅导入、导入后翻译或运行不调用 API 的演示流程；桌面版和浏览器均支持一次选择多篇并按顺序批量入库，批量模式只执行“仅导入”，逐项报告新增、重复或失败结果。
 - 左侧文献支持通过右键或操作菜单删除应用内托管副本与记录；删除前会确认，原始 PDF、外部译文和外部文件不会被删除，翻译中的文献会拒绝删除。
 - 桌面版经系统文件窗口导入原 PDF 后，真实全文翻译会在该原文件的父目录新建 `translate/`，保存中文、双语 PDF 及源文件校验清单；再次导入同一源文件时，校验通过即可复用译文，无需重复调用 API。原目录不可写时仍保留应用内译文并提示，不覆盖已有人工文件。
 - 右侧使用项目内附带的 PDF.js 和文字层渲染 PDF。原文在翻译前及翻译失败后都可阅读；原文、译文和同页对照支持连续滚动，切换视图时保留当前页、缩放和批注状态。连续阅读维护有界的 PDF 文档与页面缓存，按需渲染可视附近页面；连续缩放和窗口调整时会合并待处理的渲染请求。预览区按住 Ctrl 滚轮也可缩放。
@@ -45,7 +45,7 @@ BabelDOC 会尽量保留论文的公式、图形与页面结构，但中文长�
 
 ## 验证
 
-在项目目录运行 `python -m unittest discover -s tests -v`、`node --test tests/reader-geometry.test.mjs tests/pan-interaction.test.mjs tests/file-context-menu.test.mjs tests/library-drag-folder.test.mjs`，以及 `python -m py_compile app/core.py app/server.py app/annotations.py app/library.py run.py`。自动测试不调用真实 API。16 MiB 文件的独立服务端 tracemalloc 回归测试记录一次性读取峰值 16,786,403 bytes、分块发送峰值 140,830 bytes；这是该测试的峰值对比，不代表整体速度。另使用两页合成英文测试 PDF 验证了本机真实翻译：各页完整中文正文、公式和矢量曲线保留；该测试不使用用户研究论文。复杂表格、扫描页和特殊字体仍需人工检查。
+在项目目录运行 `python -m unittest discover -s tests -v`、`node --test tests/reader-geometry.test.mjs tests/pan-interaction.test.mjs tests/file-context-menu.test.mjs tests/library-drag-folder.test.mjs tests/import-batch.test.mjs`，以及 `python -m py_compile app/core.py app/server.py app/annotations.py app/library.py run.py`。自动测试不调用真实 API。16 MiB 文件的独立服务端 tracemalloc 回归测试记录一次性读取峰值 16,786,403 bytes、分块发送峰值 140,830 bytes；这是该测试的峰值对比，不代表整体速度。另使用两页合成英文测试 PDF 验证了本机真实翻译：各页完整中文正文、公式和矢量曲线保留；该测试不使用用户研究论文。复杂表格、扫描页和特殊字体仍需人工检查。
 
 官方依据：BabelDOC https://github.com/funstory-ai/BabelDOC ；DeepSeek 思考模式 https://api-docs.deepseek.com/guides/thinking_mode/ 。
 

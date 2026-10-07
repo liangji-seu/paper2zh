@@ -1,10 +1,11 @@
 # paper2zh Mac 适配交接
 
-面向接手 Mac 适配的 Codex。本文件对应 `main`、`v1.1.3`、基线提交 `c0a4ea4`，remote 为 `git@github.com:liangji-seu/paper2zh.git`。当前没有 Mac 实机测试证据，也没有签名或公证配置。
+面向接手 Mac 适配的 Codex。本文件随 v1.1.4 源码维护，接管时以远程 `main` 或目标发布标签为准；历史适配评估基线为 `accec17`。remote 为 `git@github.com:liangji-seu/paper2zh.git`。当前没有 Mac 实机测试证据，也没有签名或公证配置；v1.1.4 的批量导入功能也尚未获得 Mac 实机验证，不能据此宣称 macOS 支持。
 
 ## 现状和架构地图
 
 - `app/server.py` 用标准库 HTTP 服务绑定 `127.0.0.1`，提供静态页、PDF Range 读取、导入、任务、设置、批注、库和 Markdown API；`static/` 含工作区与本地 PDF.js。
+- `desktop.py` 的原生导入桥接支持多选 PDF 的有界批量入库：按选择顺序逐个处理，重复文件复用已有记录，单个失败后继续，并返回统一结果；多选只允许“仅导入，稍后翻译”，单篇翻译/演示入口保持原有行为。浏览器入口在 `static/workspace.mjs` 与 `static/import-batch.mjs` 中执行相同的顺序处理与结果汇总。
 - `app/core.py` 管理数据目录、设置、SHA-256 去重、翻译任务、BabelDOC 子进程、输出和 Markdown 调度；`app/library.py` 管理嵌套文件夹；`app/catalog.py` 管理索引；`app/annotations.py` 管理批注；`app/pdf_worker.py` 串行化 PDF 操作。
 - `run.py` 是浏览器开发入口，`desktop.py` 是 Windows 原生窗口、文件选择和剪贴板桥接入口。后者当前不能视为 Mac 入口。
 - `_find_babeldoc()` 优先 `PAPER_TRANSLATOR_PYTHON311`，再查仓库 `.runtime311` 配合 Windows `E:\miniconda\envs\EXO\python.exe` 或 `py -3.11`，最后回退 `.runtime`、PATH 的 `babeldoc` 或 `uv tool run babeldoc`；Mac 需重写/验证选择逻辑。
@@ -64,18 +65,18 @@ Mac agent 先确认已安装 Python 3.11+ 和受支持的 Node.js 版本，再�
 
 ```bash
 python -m unittest discover -s tests -v
-node --test tests/reader-geometry.test.mjs tests/pan-interaction.test.mjs tests/file-context-menu.test.mjs tests/library-drag-folder.test.mjs
+node --test tests/reader-geometry.test.mjs tests/pan-interaction.test.mjs tests/file-context-menu.test.mjs tests/library-drag-folder.test.mjs tests/import-batch.test.mjs
 python -m py_compile app/security.py app/core.py app/server.py app/annotations.py app/library.py run.py
 ```
 
-测试文件名：`test_annotations.py`、`test_core.py`、`test_desktop.py`、`test_library.py`、`test_markdown_export.py`、`test_owned_library.py`、`test_pdf_worker.py`、`test_quality.py`、`test_security.py`、`test_server_files.py`、`test_v1.py`，以及四个 `.mjs` 交互测试（含 `library-drag-folder.test.mjs`）。
+测试文件名：`test_annotations.py`、`test_core.py`、`test_desktop.py`、`test_library.py`、`test_markdown_export.py`、`test_owned_library.py`、`test_pdf_worker.py`、`test_quality.py`、`test_security.py`、`test_server_files.py`、`test_v1.py`，以及五个 `.mjs` 交互测试（含 `library-drag-folder.test.mjs` 与 `import-batch.test.mjs`）。
 
 验收顺序：
 
 1. Windows 功能不回归：桌面文件选择、DPAPI、剪贴板、安装目录 `library/`、升级迁移和引擎选择。
 2. Mac 实机服务/窗口：启动停止、端口、文件选择、导入原文、文件夹、批注、拖拽、删除和 Markdown。
 3. 公开/合成 PDF 的公式、字体、文字层和复杂页面；记录缺字体、错位或 PDF.js 差异。
-4. 托管库重复导入不重复建档/翻译；`source.md`、`translated.md`、`metadata.json` 和回链正确；删除文件夹后归属正确；数据升级可恢复。
+4. 托管库重复导入不重复建档/翻译；批量选择按顺序入库，失败项不阻断后续项，结束时能统一查看新增/重复/失败结果；单篇导入并翻译与导入并演示仍可用。`source.md`、`translated.md`、`metadata.json` 和回链正确；删除文件夹后归属正确；数据升级可恢复。
 5. 真实翻译只用用户明确配置的服务；日志/诊断脱敏且不含 Key、请求头、正文、私人文件名或 PDF/MD 内容。
 
 ## 安全和迁移边界
@@ -88,7 +89,7 @@ python -m py_compile app/security.py app/core.py app/server.py app/annotations.p
 ## 可复制给 Mac Codex 的提示词
 
 ```text
-接手 paper2zh macOS 适配。先读 docs/MACOS_HANDOFF.md、README.md、desktop.py、app/security.py、app/core.py、app/server.py、packaging/build.ps1、packaging/paper2zh.spec 和 tests/；基线 main c0a4ea4、v1.1.3。
+接手 paper2zh macOS 适配。先读 docs/MACOS_HANDOFF.md、README.md、desktop.py、app/security.py、app/core.py、app/server.py、packaging/build.ps1、packaging/paper2zh.spec 和 tests/；读取当前 VERSION 和 HEAD，不回退历史提交。
 
 先在 Apple Silicon 实机创建隔离 Python 环境，安装 requirements.txt，用临时 PAPER_TRANSLATOR_DATA_DIR 启动 python run.py，验证本地服务、公开/合成 PDF、原文、文件夹、批注、Markdown、重复导入。随后按平台适配 windll、edgechromium、剪贴板、DPAPI、LOCALAPPDATA、engine/python.exe、PyInstaller/Inno Setup 和 ico；设计 Mac Keychain、BabelDOC 运行时及 .app/DMG。protect(nonempty) 当前在非 Windows 抛 OSError，desktop.py 当前有无条件 Windows 调用，不能宣称已有 Mac 兼容。
 
