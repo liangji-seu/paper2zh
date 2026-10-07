@@ -31,6 +31,8 @@ def configure() -> int:
         os.environ.setdefault("PAPER_TRANSLATOR_SETTINGS_PATH", str(data / "settings.json"))
     data.mkdir(parents=True, exist_ok=True)
     os.environ["PAPER_TRANSLATOR_DATA_DIR"] = str(data)
+    from app.diagnostics import configure as configure_diagnostics
+    configure_diagnostics(data)
     engine = resource_root() / "engine" / "python.exe"
     if engine.is_file():
         os.environ["PAPER_TRANSLATOR_PYTHON311"] = str(engine)
@@ -251,6 +253,33 @@ class DesktopBridge:
         except (ValueError, OSError, FileNotFoundError) as exc:
             return {"error": str(exc)}
 
+    def save_diagnostics(self) -> dict:
+        """Native Save As for the small, privacy-filtered diagnostics bundle."""
+        import webview
+        from app.diagnostics import export_bytes
+
+        if self._window is None:
+            return {"error": "桌面窗口尚未就绪。"}
+        chosen = self._window.create_file_dialog(
+            webview.FileDialog.SAVE,
+            save_filename="paper2zh-diagnostics.zip",
+            file_types=("诊断日志 ZIP (*.zip)",),
+        )
+        if not chosen:
+            return {"cancelled": True}
+        destination = Path(str(chosen[0]))
+        temporary = destination.with_name(f".{destination.name}.tmp")
+        try:
+            temporary.write_bytes(export_bytes())
+            os.replace(temporary, destination)
+            return {"saved": True, "filename": destination.name}
+        except (OSError, TypeError, ValueError):
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return {"error": "诊断日志保存失败，请选择可写的位置。"}
+
     def copy_markdown_directory(self, job_id: str) -> dict:
         """Copy only the verified Markdown directory for a known job."""
         if not isinstance(job_id, str) or not job_id:
@@ -288,6 +317,9 @@ def main() -> None:
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
     port = configure()
+    from app.diagnostics import install_exception_hooks, record as diagnostic, record_exception as diagnostic_exception
+    install_exception_hooks()
+    diagnostic("desktop_start", fields={"phase": "startup"})
     from app.server import run
     import webview
 
@@ -304,7 +336,9 @@ def main() -> None:
         except (urllib.error.URLError, TimeoutError):
             time.sleep(0.1)
     else:
-        raise RuntimeError("本地阅读服务启动失败。")
+        error = RuntimeError("本地阅读服务启动失败。")
+        diagnostic_exception("desktop_start_failed", error, fields={"phase": "health_check"})
+        raise error
     bridge = DesktopBridge()
     bridge._window = webview.create_window(
         "paper2zh · 论文工作区",

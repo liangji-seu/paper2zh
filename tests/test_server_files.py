@@ -23,6 +23,8 @@ class FileResponseTests(unittest.TestCase):
         self.payload = bytes(range(256)) * 4096
         self.file = self.root / "sample.pdf"
         self.file.write_bytes(self.payload)
+        self.special_file = self.root / "测试 文档 [v1] #100%.pdf"
+        self.special_file.write_bytes(self.payload)
         self.big_file = self.root / "big.pdf"
         self.big_file.write_bytes(b"x" * (16 * 1024 * 1024))
         self.errors: list[type[BaseException]] = []
@@ -40,6 +42,9 @@ class FileResponseTests(unittest.TestCase):
                     return
                 if self.path.startswith("/measure-new"):
                     self._measure("new", super()._send_file)
+                    return
+                if self.path.startswith("/special-file"):
+                    self._send_file(parent.special_file, inline=True)
                     return
                 super().do_GET()
 
@@ -139,6 +144,31 @@ class FileResponseTests(unittest.TestCase):
         status, _headers, body = self.request(headers={"Range": "bytes=4-9", "If-Range": "stale"})
         self.assertEqual(status, 200)
         self.assertEqual(body, self.payload)
+
+    def test_unicode_content_disposition_survives_full_range_and_416_responses(self):
+        expected = server._content_disposition("inline", self.special_file.name)
+
+        status, headers, body = self.request("/special-file")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, self.payload)
+        self.assertEqual(headers["Content-Disposition"], expected)
+
+        status, headers, body = self.request("/special-file", headers={"Range": "bytes=4-9"})
+        self.assertEqual(status, 206)
+        self.assertEqual(body, self.payload[4:10])
+        self.assertEqual(headers["Content-Disposition"], expected)
+
+        status, headers, body = self.request("/special-file", headers={"Range": f"bytes={len(self.payload)}-"})
+        self.assertEqual(status, 416)
+        self.assertEqual(body, b"")
+        self.assertEqual(headers["Content-Disposition"], expected)
+
+    def test_content_disposition_escapes_quotes_and_controls(self):
+        value = server._content_disposition("attachment", 'a "quote" \\ backslash\r\n.pdf')
+        self.assertEqual(value, 'attachment; filename="a \\"quote\\" \\\\ backslash.pdf"; filename*=UTF-8\'\'a%20%22quote%22%20%5C%20backslash.pdf')
+        self.assertNotIn("\r", value)
+        self.assertNotIn("\n", value)
+        value.encode("latin-1")
 
     def test_client_disconnect_is_quiet_and_health_survives(self):
         self.drain_raw("/static/big.pdf")

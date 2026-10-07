@@ -4,13 +4,14 @@ import json
 import mimetypes
 import os
 import threading
+import unicodedata
 import urllib.error
 import urllib.request
 from email import policy
 from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from .annotations import (
     MAX_ANNOTATION_BODY_BYTES,
@@ -24,6 +25,7 @@ from .annotations import (
 from .core import DATA, JOBS, MAX_UPLOAD_BYTES, create_job, create_job_from_path, file_path, get_workspace_preferences, list_jobs, load_job, public_settings, read_settings, render_page, save_settings, save_workspace_preferences, translate_job
 from .library import MAX_LIBRARY_BODY_BYTES, apply_action, get_library
 from .markdown_export import MarkdownExportError, markdown_directory
+from .diagnostics import MAX_CLIENT_ERROR_BYTES, client_error, export_bytes, record_exception as diagnostic_exception
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "static"
@@ -92,6 +94,26 @@ def json_bytes(payload: object) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
+def _content_disposition(disposition: str, filename: str | Path) -> str:
+    """Build a latin-1-safe Content-Disposition value for a downloaded file."""
+    basename = filename.name if isinstance(filename, Path) else filename
+    clean_name = "".join(char for char in basename if unicodedata.category(char) != "Cc")
+    if not clean_name:
+        clean_name = "download"
+
+    fallback: list[str] = []
+    for char in clean_name:
+        if char in {'"', "\\"}:
+            fallback.append("\\" + char)
+        elif char.isascii() and char.isprintable():
+            fallback.append(char)
+        else:
+            fallback.append("_")
+    fallback_name = "".join(fallback) or "download"
+    encoded_name = quote(clean_name.encode("utf-8"), safe="!#$&+-.^_`|~")
+    return f'{disposition}; filename="{fallback_name}"; filename*=UTF-8\'\'{encoded_name}'
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "PaperTranslator/0.1"
 
@@ -102,6 +124,16 @@ class Handler(BaseHTTPRequestHandler):
         else:
             safe_path = self.path.split("?", 1)[0]
         print(f"[{self.log_date_time_string()}] {self.command} {safe_path}")
+
+    def handle_one_request(self) -> None:
+        # BaseHTTPRequestHandler normally lets unexpected GET failures escape
+        # to the server thread. Capture them here so every request path gets a
+        # diagnostic record without recording request data or exception text.
+        try:
+            super().handle_one_request()
+        except Exception as exc:
+            diagnostic_exception("http_unhandled", exc, fields={"method": getattr(self, "command", "request"), "route": "request"})
+            raise
 
     def _send(self, status: int, payload: bytes, content_type: str = "application/json; charset=utf-8", headers: dict[str, str] | None = None) -> None:
         self.send_response(status)
@@ -166,6 +198,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/workspace-preferences":
             self._json(200, get_workspace_preferences())
+            return
+        if path == "/api/diagnostics/download":
+            payload = export_bytes()
+            self._send(200, payload, "application/zip", {"Content-Disposition": 'attachment; filename="paper2zh-diagnostics.zip"'})
             return
         parts = [x for x in path.split("/") if x]
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "jobs" and parts[3] == "markdown-location":
@@ -255,7 +291,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", "0")
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("Content-Disposition", f'{disposition}; filename="{path.name}"')
+                self.send_header("Content-Disposition", _content_disposition(disposition, path.name))
                 self.end_headers()
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
@@ -269,7 +305,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(length))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Content-Disposition", f'{disposition}; filename="{path.name}"')
+            self.send_header("Content-Disposition", _content_disposition(disposition, path.name))
             if accepts_range:
                 self.send_header("Accept-Ranges", "bytes")
             if byte_range:
@@ -297,7 +333,7 @@ class Handler(BaseHTTPRequestHandler):
             route_parts = [x for x in path.split("/") if x]
             annotation_route = len(route_parts) == 5 and route_parts[:2] == ["api", "jobs"] and route_parts[3] in {"source", "translated"} and route_parts[4] == "annotations"
             local_import_route = path == "/api/jobs/import-local"
-            body_limit = MAX_ANNOTATION_BODY_BYTES if annotation_route else MAX_LIBRARY_BODY_BYTES if path == "/api/library" else 64 * 1024 if local_import_route else None
+            body_limit = MAX_ANNOTATION_BODY_BYTES if annotation_route else MAX_LIBRARY_BODY_BYTES if path == "/api/library" else 64 * 1024 if local_import_route else MAX_CLIENT_ERROR_BYTES if path == "/api/diagnostics/client-error" else None
             body = self._read_body(body_limit)
             if local_import_route:
                 if self.headers.get("X-Paper-Translator-Desktop") != "1":
@@ -341,6 +377,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("工作区偏好必须使用 application/json。")
                 payload = json.loads(body.decode("utf-8")) if body else {}
                 self._json(200, save_workspace_preferences(payload))
+                return
+            if path == "/api/diagnostics/client-error":
+                if request_content_type.split(";", 1)[0].strip().lower() != "application/json":
+                    raise ValueError("诊断上报必须使用 application/json。")
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                self._json(200, client_error(payload))
                 return
             if path == "/api/test-connection":
                 result = test_connection()
@@ -405,6 +447,7 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as exc:
             self._json(400, {"error": str(exc)})
         except Exception as exc:
+            diagnostic_exception("http_unhandled", exc, fields={"method": self.command, "route": "api_post"})
             self._json(500, {"error": f"服务器处理失败：{exc}"})
 
 

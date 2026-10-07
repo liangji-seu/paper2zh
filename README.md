@@ -8,7 +8,7 @@ paper2zh 在本机浏览器中管理和阅读 PDF。左侧可按嵌套文件夹�
 
 ## 安装桌面版
 
-从 [当前公开发布页](https://github.com/liangji-seu/paper2zh/releases/latest)下载 Windows 安装包；当前源码版本为 `v1.1.4`。安装程序默认安装在 `E:\paper2zh`，无需管理员权限；系统需要 Microsoft WebView2 运行时。桌面版附带独立 Python 3.11 与 BabelDOC 依赖，不要求系统安装 Python。首次翻译可能下载模型、字体等资源，请保持网络连接。
+从 [当前公开发布页](https://github.com/liangji-seu/paper2zh/releases/latest)下载 Windows 安装包；当前源码版本为 `v1.1.5`。安装程序默认安装在 `E:\paper2zh`，无需管理员权限；系统需要 Microsoft WebView2 运行时。桌面版附带独立 Python 3.11 与 BabelDOC 依赖，不要求系统安装 Python。首次翻译可能下载模型、字体等资源，请保持网络连接。
 
 桌面版使用系统文件窗口选择 PDF。文献、译文、批注及 SQLite 索引保存在安装目录的 `library/` 中，默认路径为 `E:\paper2zh\library`。升级后首次打开会复制旧 `%LOCALAPPDATA%\paper2zh` 中的文献与文件夹记录，旧目录保留。API 配置和已有模型缓存继续使用原用户目录；API Key 由当前 Windows 用户的 DPAPI 加密。安装包不包含用户论文、数据库、Markdown、Key、批注或模型缓存。源码开发版继续使用独立的 `data/`。
 
@@ -42,6 +42,8 @@ BabelDOC 会尽量保留论文的公式、图形与页面结构，但中文长�
 服务只绑定 127.0.0.1。源码版的论文、任务、文件夹、批注和输出 PDF 保存在项目 `data/`；Windows 桌面版把文献、译文、批注及 SQLite 索引保存在安装目录的 `library/`，API 设置和已有模型缓存仍保存在用户目录。PDF.js、字体和渲染资源从本机加载，不依赖 CDN。API Key 在 Windows 交互式用户会话下用 DPAPI 加密保存；浏览器只收到是否设置及掩码，不持久化或记录明文。更换 Provider 或 Base URL 时，必须重新填 Key，或明确勾选复用。真实翻译会将论文文本发送到用户设置的 API 服务；本机批注不发送给翻译服务。PDF 服务支持单段 Range 按需读取，并按 64 KiB 分块发送，避免一次性读入整份文件。
 
 关闭浏览器不会停止本地服务；关闭服务命令窗口即可停止。
+
+诊断日志保存在桌面版 `library/logs/diagnostics.log`，源码版为 `data/logs/diagnostics.log`；单个日志达到 2 MiB 时轮转，最多保留 3 个备份。API 设置中的“下载诊断日志”只导出这些诊断日志和版本摘要，不包含 `engine.log`、论文、PDF、Markdown、数据库、设置或 API Key。日志只记录阶段、任务 ID、异常类型和不含源码/变量的安全栈帧；预览错误只会上报固定错误类别、PDF 侧别和页码。
 
 ## 验证
 

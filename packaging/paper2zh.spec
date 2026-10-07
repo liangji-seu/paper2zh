@@ -15,6 +15,7 @@ a = Analysis(
     datas=webview_datas + pythonnet_datas + clr_datas + [
         (str(root / "static"), "static"),
         (str(root / "babeldoc_local.py"), "."),
+        (str(root / "VERSION"), "."),
     ],
     hiddenimports=webview_imports + pythonnet_imports + clr_imports + collect_submodules("webview.platforms"),
     hookspath=[],

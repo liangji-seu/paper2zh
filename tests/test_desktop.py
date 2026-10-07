@@ -17,7 +17,7 @@ class DesktopBridgeTests(unittest.TestCase):
         bridge = DesktopBridge()
         bridge._window = object()
         public = {name for name in dir(bridge) if not name.startswith("_")}
-        self.assertEqual(public, {"import_pdf", "save_translation", "copy_markdown_directory", "get_workspace_preferences", "save_workspace_preferences"})
+        self.assertEqual(public, {"import_pdf", "save_translation", "save_diagnostics", "copy_markdown_directory", "get_workspace_preferences", "save_workspace_preferences"})
 
     def _bundle(self):
         temporary = tempfile.TemporaryDirectory()
@@ -55,8 +55,30 @@ class DesktopBridgeTests(unittest.TestCase):
 
     def _webview(self):
         webview = types.ModuleType("webview")
-        webview.FileDialog = types.SimpleNamespace(OPEN=object())
+        webview.FileDialog = types.SimpleNamespace(OPEN=object(), SAVE=object())
         return webview
+
+    def test_save_diagnostics_native_success_cancel_and_failure(self):
+        temporary = tempfile.TemporaryDirectory(dir=Path.cwd())
+        root = Path(temporary.name)
+        try:
+            destination = root / "diagnostics.zip"
+            bridge, calls = self._bridge_with_picker([str(destination)])
+            with patch.dict(sys.modules, {"webview": self._webview()}), patch("app.diagnostics.export_bytes", return_value=b"safe diagnostics"):
+                result = bridge.save_diagnostics()
+            self.assertEqual(result, {"saved": True, "filename": "diagnostics.zip"})
+            self.assertEqual(destination.read_bytes(), b"safe diagnostics")
+            self.assertEqual(calls[0][1]["save_filename"], "paper2zh-diagnostics.zip")
+
+            cancel_bridge, _ = self._bridge_with_picker([])
+            with patch.dict(sys.modules, {"webview": self._webview()}), patch("app.diagnostics.export_bytes", return_value=b"safe diagnostics"):
+                self.assertEqual(cancel_bridge.save_diagnostics(), {"cancelled": True})
+
+            fail_bridge, _ = self._bridge_with_picker([str(root / "failed.zip")])
+            with patch.dict(sys.modules, {"webview": self._webview()}), patch("app.diagnostics.export_bytes", side_effect=OSError("private path")):
+                self.assertEqual(fail_bridge.save_diagnostics(), {"error": "诊断日志保存失败，请选择可写的位置。"})
+        finally:
+            temporary.cleanup()
 
     def _bridge_with_picker(self, chosen, calls=None):
         bridge = DesktopBridge()

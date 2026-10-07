@@ -24,6 +24,7 @@ from pypdf import PdfReader
 from .security import mask, protect, unprotect
 from .progress import parse_engine_progress
 from . import catalog
+from .diagnostics import configure as configure_diagnostics, record as diagnostic, record_exception as diagnostic_exception
 from .pdf_worker import pdf_serialized
 
 
@@ -35,6 +36,7 @@ elif getattr(sys, "_MEIPASS", None):
     DATA = Path(sys.executable).resolve().parent / "library"
 else:
     DATA = ROOT / "data"
+configure_diagnostics(DATA)
 JOBS = DATA / "jobs"
 _configured_settings = os.environ.get("PAPER_TRANSLATOR_SETTINGS_PATH", "").strip()
 if _configured_settings:
@@ -1039,6 +1041,8 @@ def _run_demo(job: dict[str, Any]) -> tuple[Path, Path]:
 
 def _worker(job: dict[str, Any]) -> None:
     engine_started = False
+    job_id = str(job.get("id", "")) or None
+    diagnostic("translation_started", job_id=job_id, fields={"phase": "worker"})
     try:
         job["status"] = "running"
         job["progress"] = None
@@ -1065,9 +1069,11 @@ def _worker(job: dict[str, Any]) -> None:
                 job["message"] = f"已复用同源全文译文，未再次调用 API。{warning}"
             save_job(job)
             _enqueue_markdown_export(job)
+            diagnostic("translation_finished", job_id=job_id, fields={"status": "reused", "phase": "worker"})
             return
         settings = read_settings()
         if job["demo_mode"]:
+            diagnostic("translation_phase", job_id=job_id, fields={"phase": "demo"})
             translated, bilingual = _run_demo(job)
             job.update({"progress": max(float(job.get("progress") or 0), 95.0), "progress_indeterminate": False, "stage": "publishing"})
         else:
@@ -1076,6 +1082,7 @@ def _worker(job: dict[str, Any]) -> None:
             job["stage"] = "engine"
             save_job(job)
             engine_started = True
+            diagnostic("translation_phase", job_id=job_id, fields={"phase": "engine"})
             translated, bilingual = _run_babeldoc(job, settings)
         external_warning = _publish_external_full_outputs(job, translated, bilingual) if job.get("mode") == "full" and not job.get("demo_mode") else None
         job["translated_file"] = translated.relative_to(JOBS / job["id"]).as_posix()
@@ -1096,9 +1103,12 @@ def _worker(job: dict[str, Any]) -> None:
         job["progress_indeterminate"] = True
         job["stage"] = "failed"
         job["error"] = str(exc)
+        diagnostic_exception("translation_failed", exc, job_id=job_id, fields={"phase": "worker"})
     if engine_started:
         _record_engine_usage(job)
     save_job(job)
+    if job.get("status") == "completed":
+        diagnostic("translation_finished", job_id=job_id, fields={"status": "completed", "phase": "worker"})
     _enqueue_markdown_export(job)
 
 

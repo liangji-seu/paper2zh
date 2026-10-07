@@ -195,14 +195,14 @@ export class ContinuousReader {
         const annotations = await this.getAnnotations(slot.jobId, slot.side);
         if (current()) this.drawAnnotations(slot, annotations.annotations || []);
       } catch (error) {
-        if (current()) this.onError(`批注暂不可用：${error.message}`);
+        if (current()) this.onError(`批注暂不可用：${error.message}`, {event: "pdf_annotation_failed", pdf: slot.side, page: slot.page, job_id: slot.jobId});
       }
     } catch (error) {
       if (!current() || error?.name === "RenderingCancelledException") return;
       this.releaseSlot(slot);
       slot.error.textContent = `${slot.side === "source" ? "原文" : "译文"}第 ${slot.page} 页读取失败：${error.message}`;
       slot.error.classList.add("show");
-      this.onError(slot.error.textContent);
+      this.onError(slot.error.textContent, {event: "pdf_preview_failed", pdf: slot.side, page: slot.page, job_id: slot.jobId});
     } finally {
       if (slot.requestId === requestId) slot.loading = false;
       this.trimRows();
