@@ -71,7 +71,7 @@ class DesktopBridgeTests(unittest.TestCase):
         return bridge, calls
 
     def test_import_pdf_batch_uses_native_multi_picker_and_continues_after_failure(self):
-        chosen = [r"C:\papers\first.pdf", r"C:\papers\broken.pdf", r"C:\papers\duplicate.pdf"]
+        chosen = [str(Path("papers") / name) for name in ("first.pdf", "broken.pdf", "duplicate.pdf")]
         bridge, calls = self._bridge_with_picker(chosen)
         jobs = {
             chosen[0]: {"id": "job-1", "message": "已导入源 PDF。"},
