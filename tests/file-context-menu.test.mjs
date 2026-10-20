@@ -25,7 +25,7 @@ test("missing markdown directory is reported instead of claiming a copy", () => 
 
 function deletionHarness({jobs, activeJob = null, reject = false} = {}) {
   const nodes = new Map();
-  for (const id of ["delete-modal", "delete-name", "delete-msg", "submit-delete", "annotation-menu", "empty", "pages", "title", "notice", "progress-wrap", "progress-stage", "progress-value", "progress-fill", "token-usage", "status-text", "status", "page-number", "total", "zoom-label", "open-translate", "open-download"]) {
+  for (const id of ["delete-modal", "delete-name", "delete-msg", "submit-delete", "annotation-menu", "empty", "pages", "pagebar", "title", "notice", "progress-wrap", "progress-stage", "progress-value", "progress-fill", "token-usage", "status-text", "status", "page-number", "total", "zoom-label", "open-translate", "open-download"]) {
     const classes = new Set();
     nodes.set(id, {hidden: false, value: "", textContent: "", disabled: false, classList: {add: name => classes.add(name), remove: name => classes.delete(name), contains: name => classes.has(name)}});
   }
@@ -36,6 +36,7 @@ function deletionHarness({jobs, activeJob = null, reject = false} = {}) {
     state, $: id => nodes.get(id), jobTitle: job => job.title || job.filename || "", path: id => encodeURIComponent(String(id)),
     msg: (id, text) => { nodes.get(id).textContent = text; }, open: () => {}, close: id => nodes.get(id).classList.remove("open"),
     clearTimeout: id => calls.push(["clearTimeout", id]), disposeDocument: key => delete state.docs[key], renderList: () => calls.push(["renderList"]),
+    agentPanel: {setPaper: () => {}},
     reader: {destroy: () => calls.push(["destroy"])}, post: async (url, body) => { calls.push(["post", url, body]); if (reject) throw Error("拒绝删除"); return {library: {folders: [], documents: {}}}; },
     api: async () => ({folders: [], documents: {}}), loadJobs: async () => calls.push(["loadJobs"]), select: async id => calls.push(["select", id]),
   };
@@ -70,6 +71,7 @@ test("deleting the current last job clears the reader state", async () => {
   assert.equal(h.state.page, 1);
   assert.equal(h.nodes.get("empty").hidden, false);
   assert.equal(h.nodes.get("pages").hidden, true);
+  assert.equal(h.nodes.get("pagebar").hidden, true);
   assert.equal(h.nodes.get("notice").textContent, "");
   assert.equal(h.nodes.get("progress-wrap").hidden, true);
 });

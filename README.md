@@ -18,6 +18,18 @@ paper2zh 在本机浏览器中管理和阅读 PDF。左侧可按嵌套文件夹�
 
 翻译成功后在后台自动生成 `library/jobs/<文献ID>/markdown/source.md`、`translated.md` 和 `metadata.json`。`library/index.json` 列出已导出的文献及相对路径，Codex 等 Agent 可以直接读取，无需访问 API 设置。`source.md` 保留完整原文；试译的中文 Markdown 只对应所选页码，元数据明确记录翻译范围。Markdown 包含页码与 PDF 回链，采用本地文字提取，不额外调用翻译 API；扫描页及复杂公式、表格的准确排版仍以 PDF 为准。请备份整个 `library/`，保持数据库、文献和批注一起保存。
 
+## 界面与 Claude Code 助手
+
+工作区采用三栏布局：左侧是 Agentero 风格的文件树（论文库、嵌套文件夹、论文，可拖拽整理），中间是 PDF 阅读区，右侧是 Claude Code 助手。顶部标签显示当前论文，页码与缩放控件浮在阅读区底部；左侧栏和右侧助手栏都能拖动分隔线调整宽度、折叠，并记住宽度。界面跟随系统亮色/暗色外观。
+
+![工作区：左侧文献树、中间阅读区、右侧 Claude Code 助手](docs/assets/workspace-preview.png)
+
+右侧助手直接调用本机已安装并登录的 Claude Code CLI（`claude`），把当前论文作为只读上下文：已导出 Markdown 时读取 `source.md` / `translated.md`，否则从本地 PDF 按页提取文本。助手只被授予 `Read`、`Glob`、`Grep` 三个只读工具，不能修改文献库；回答流式返回，文件读取等工具调用显示为小标签。找不到 CLI 时可设置环境变量 `PAPER2ZH_CLAUDE_BIN` 指向可执行文件。
+
+- 会话 ID 与论文上下文缓存保存在应用数据目录的 `agent/`（桌面版为 `%LOCALAPPDATA%\paper2zh\agent`，源码版为 `data/agent`），不写入 `library/`，不会改动已有文献。
+- 切换论文会开始新的会话；助手标题栏的“新对话”按钮可清空当前会话。
+- 模型、额度与计费沿用 Claude Code 自己的设置，本软件不保存其凭据。
+
 顶部采用紧凑工具栏；拖动侧栏分隔线可调整宽度，点击箭头可折叠，重启后恢复宽度。预览默认选择文字，按住空格临时切换抓手，松开恢复。下载按钮直接另存中文 PDF，不再选择原文或双语版本。
 
 ## 从源码启动
@@ -47,7 +59,7 @@ BabelDOC 会尽量保留论文的公式、图形与页面结构，但中文长�
 
 ## 验证
 
-在项目目录运行 `python -m unittest discover -s tests -v`、`node --test tests/reader-geometry.test.mjs tests/pan-interaction.test.mjs tests/file-context-menu.test.mjs tests/library-drag-folder.test.mjs tests/import-batch.test.mjs`，以及 `python -m py_compile app/core.py app/server.py app/annotations.py app/library.py run.py`。自动测试不调用真实 API。16 MiB 文件的独立服务端 tracemalloc 回归测试记录一次性读取峰值 16,786,403 bytes、分块发送峰值 140,830 bytes；这是该测试的峰值对比，不代表整体速度。另使用两页合成英文测试 PDF 验证了本机真实翻译：各页完整中文正文、公式和矢量曲线保留；该测试不使用用户研究论文。复杂表格、扫描页和特殊字体仍需人工检查。
+在项目目录运行 `python -m unittest discover -s tests -v`、`node --test tests/reader-geometry.test.mjs tests/pan-interaction.test.mjs tests/file-context-menu.test.mjs tests/library-drag-folder.test.mjs tests/import-batch.test.mjs`，以及 `python -m py_compile app/core.py app/server.py app/agent.py app/annotations.py app/library.py run.py`。自动测试不调用真实 API。16 MiB 文件的独立服务端 tracemalloc 回归测试记录一次性读取峰值 16,786,403 bytes、分块发送峰值 140,830 bytes；这是该测试的峰值对比，不代表整体速度。另使用两页合成英文测试 PDF 验证了本机真实翻译：各页完整中文正文、公式和矢量曲线保留；该测试不使用用户研究论文。复杂表格、扫描页和特殊字体仍需人工检查。助手相关测试只检查命令构造、事件映射和上下文导出，不会启动 Claude Code。
 
 官方依据：BabelDOC https://github.com/funstory-ai/BabelDOC ；DeepSeek 思考模式 https://api-docs.deepseek.com/guides/thinking_mode/ 。
 

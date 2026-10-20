@@ -2,6 +2,7 @@ import * as pdfjs from "/static/vendor/pdfjs/pdf.mjs";
 import {ContinuousReader} from "/static/reader.mjs";
 import {clampMenuPosition,markdownDirectoryFromResult,markdownLocationUrl} from "/static/file-context-menu.mjs";
 import {importFilesSequential,normalizeImportResult,summarizeImportResults,validateImportFile} from "/static/import-batch.mjs";
+import {createAgentPanel} from "/static/agent-panel.mjs";
 pdfjs.GlobalWorkerOptions.workerSrc = "/static/vendor/pdfjs/pdf.worker.mjs";
 const $=id=>document.getElementById(id);
 const state={jobs:[],job:null,file:null,files:[],importInFlight:false,page:1,zoom:100,view:"compare",timer:null,docs:{},annotations:{},cacheJobOrder:[],selection:null,selectedAnnotation:null,undo:null,readerPreserve:true,selectRequest:0,jobsRequest:0,deletedJobIds:new Set(),library:{folders:[],documents:{}},expanded:new Set(),folderEdit:null,movingJob:null,deletingJob:null,deleteInFlight:null,deletingFolder:null,folderDeleteInFlight:null,folderDeleteRequest:0,draggingJob:null,dragMoveInFlight:null,dragRenderPending:false,dropFolderId:undefined};
@@ -27,6 +28,13 @@ function adjustSidebarByKeyboard(event){const {min,max}=sidebarLimits();if(event
 function saveSidebarBridge(){const bridge=window.pywebview?.api;if(typeof bridge?.save_workspace_preferences!=="function")return;Promise.resolve(bridge.save_workspace_preferences({sidebar_width:Math.round(sidebarPrefs.width),sidebar_collapsed:sidebarPrefs.collapsed})).catch(_error=>{});}
 async function syncSidebarPreferences(){const bridge=window.pywebview?.api;if(typeof bridge?.get_workspace_preferences!=="function")return;try{const prefs=await bridge.get_workspace_preferences();if(Number.isFinite(Number(prefs?.sidebar_width)))sidebarPrefs.width=Number(prefs.sidebar_width);if(typeof prefs?.sidebar_collapsed==="boolean")sidebarPrefs.collapsed=prefs.sidebar_collapsed;setSidebarCollapsed(sidebarPrefs.collapsed,false);applySidebarWidth(sidebarPrefs.width);writePreference(sidebarKeys.width,sidebarPrefs.width);writePreference(sidebarKeys.collapsed,sidebarPrefs.collapsed);requestRenderPage();}catch(_error){}}
 function initSidebar(){const savedWidth=Number(readPreference(sidebarKeys.width,250));sidebarPrefs.collapsed=readPreference(sidebarKeys.collapsed,"false")==="true";sidebarPrefs.width=Number.isFinite(savedWidth)?savedWidth:250;applySidebarWidth(sidebarPrefs.width);setSidebarCollapsed(sidebarPrefs.collapsed,false);const handle=$("sidebar-resizer");handle.addEventListener("pointerdown",startSidebarResize);handle.addEventListener("keydown",adjustSidebarByKeyboard);$("sidebar-toggle").addEventListener("click",event=>{event.stopPropagation();toggleSidebar();});window.addEventListener("pywebviewready",syncSidebarPreferences);syncSidebarPreferences();}
+const agentPrefs={width:360,collapsed:false,dragging:false,frame:0,pendingWidth:360};
+const agentKeys={width:"paper2zh.agent.width",collapsed:"paper2zh.agent.collapsed"};
+function agentLimits(){const min=300;const max=Math.max(min,Math.min(680,window.innerWidth-560));return {min,max};}
+function applyAgentWidth(width,persist=false){const {min,max}=agentLimits();agentPrefs.width=Math.max(min,Math.min(max,Number(width)||360));document.querySelector(".app").style.setProperty("--agent-width",agentPrefs.width+"px");const handle=$("agent-resizer");handle?.setAttribute("aria-valuemin",String(min));handle?.setAttribute("aria-valuemax",String(max));handle?.setAttribute("aria-valuenow",String(Math.round(agentPrefs.width)));if(persist)writePreference(agentKeys.width,agentPrefs.width);}
+function setAgentCollapsed(collapsed,persist=true){agentPrefs.collapsed=Boolean(collapsed);document.querySelector(".app").classList.toggle("agent-collapsed",agentPrefs.collapsed);const toggle=$("toggle-agent");if(toggle){toggle.title=agentPrefs.collapsed?"显示助手":"隐藏助手";toggle.setAttribute("aria-pressed",String(!agentPrefs.collapsed));}if(persist)writePreference(agentKeys.collapsed,agentPrefs.collapsed);applyAgentWidth(agentPrefs.width,persist);}
+function startAgentResize(event){if(agentPrefs.collapsed||event.button!==0)return;event.preventDefault();agentPrefs.dragging=true;agentPrefs.pendingWidth=agentPrefs.width;document.body.classList.add("agent-resizing");const startX=event.clientX,startWidth=agentPrefs.width;const move=moveEvent=>{agentPrefs.pendingWidth=startWidth-(moveEvent.clientX-startX);if(agentPrefs.frame)return;agentPrefs.frame=requestAnimationFrame(()=>{agentPrefs.frame=0;applyAgentWidth(agentPrefs.pendingWidth);});};const end=()=>{window.removeEventListener("pointermove",move);window.removeEventListener("pointerup",end);window.removeEventListener("pointercancel",end);window.removeEventListener("blur",end);if(agentPrefs.frame){cancelAnimationFrame(agentPrefs.frame);agentPrefs.frame=0;}agentPrefs.dragging=false;document.body.classList.remove("agent-resizing");applyAgentWidth(agentPrefs.pendingWidth,true);requestRenderPage();};window.addEventListener("pointermove",move);window.addEventListener("pointerup",end);window.addEventListener("pointercancel",end);window.addEventListener("blur",end);}
+function initAgent(){const savedWidth=Number(readPreference(agentKeys.width,360));agentPrefs.width=Number.isFinite(savedWidth)?savedWidth:360;const stored=readPreference(agentKeys.collapsed,null);agentPrefs.collapsed=stored===null?window.innerWidth<980:stored==="true";applyAgentWidth(agentPrefs.width);setAgentCollapsed(agentPrefs.collapsed,false);$("agent-resizer").addEventListener("pointerdown",startAgentResize);$("toggle-agent").addEventListener("click",()=>{setAgentCollapsed(!agentPrefs.collapsed);requestRenderPage();});$("agent-collapse").addEventListener("click",()=>{setAgentCollapsed(true);requestRenderPage();});}
 function msg(id,text,kind=""){if(id==="status"){$("status-text").textContent=text;$("status").className="status"+(kind?" "+kind:"");return;}const el=$(id);el.textContent=text;el.className="msg"+(kind?" "+kind:"");}
 function reportClientError(context={}){const payload={event:context.event||"pdf_preview_failed"};for(const key of ["pdf","page","job_id"]){if(context[key]!==undefined)payload[key]=context[key];}try{fetch("/api/diagnostics/client-error",{method:"POST",headers:{"Content-Type":"application/json","X-Paper-Translator":"1"},body:JSON.stringify(payload),keepalive:true}).catch(()=>{});}catch(_error){}}
 function open(id){if(id==="import-modal"&&state.importInFlight)return;const modal=$(id);modal.classList.add("open");if(id==="delete-modal")$("delete-cancel")?.focus?.();if(id==="folder-delete-modal")$("folder-delete-cancel")?.focus?.();if(id==="settings-modal")loadSettings();}
@@ -57,7 +65,10 @@ function documentDrop(event,folderId,target){if(!canHandleDocumentDrop(event))re
 function bindDocumentDropTarget(target,folderId){target.dataset.folderId=folderId===null?"":String(folderId);target.addEventListener("dragover",event=>documentDragOver(event,folderId,target));target.addEventListener("dragenter",event=>documentDragOver(event,folderId,target));target.addEventListener("dragleave",event=>documentDragLeave(event,target));target.addEventListener("drop",event=>documentDrop(event,folderId,target));}
 const uiIcons={
   file:'<svg viewBox="0 0 16 16" focusable="false"><path d="M3.5 1.75h5.25L12.5 5.5v8.75h-9z"/><path d="M8.75 1.75V5.5h3.75"/><path d="M5.5 8h5M5.5 10.5h5"/></svg>',
+  paper:'<svg viewBox="0 0 16 16" focusable="false"><path d="M3.5 1.75h5.25L12.5 5.5v8.75h-9z"/><path d="M8.75 1.75V5.5h3.75"/><path d="M5.5 8h5M5.5 10.5h5"/></svg>',
+  library:'<svg viewBox="0 0 16 16" focusable="false"><path d="M2 13.5V2.5M4.6 13.5V2.5M8.4 13.5V4.6l2.6-.9v9.8M12.4 13.5V4.4l1.4-.4"/></svg>',
   folder:'<svg viewBox="0 0 16 16" focusable="false"><path d="M1.75 4.5h4l1.25 1.5h7.25v7.75h-12.5z"/><path d="M1.75 4.5V3.25h4l1.25 1.25"/></svg>',
+  "folder-open":'<svg viewBox="0 0 16 16" focusable="false"><path d="M1.75 4.5h4l1.25 1.5h7.25v1.25H3.5l-1.75 6V4.5z"/><path d="M1.75 13.25 3.5 7.25h11.25l-1.75 6z"/></svg>',
   "chevron-right":'<svg viewBox="0 0 16 16" focusable="false"><path d="m6 3.5 4.5 4.5L6 12.5"/></svg>',
   "chevron-down":'<svg viewBox="0 0 16 16" focusable="false"><path d="m3.5 6 4.5 4.5L12.5 6"/></svg>',
   more:'<svg viewBox="0 0 16 16" focusable="false"><circle cx="3.25" cy="8" r="1"/><circle cx="8" cy="8" r="1"/><circle cx="12.75" cy="8" r="1"/></svg>',
@@ -76,7 +87,7 @@ async function copyMarkdownDirectory(job){if(!job?.id)throw Error("未找到要�
   const result=await api(markdownLocationUrl(job.id));const directory=markdownDirectoryFromResult(result);await copyText(directory);return directory;}
 function isDeletedJob(jobId){return state.deletedJobIds.has(String(jobId));}
 function deleteDocument(job){if(!job?.id||isDeletedJob(job.id)||state.deleteInFlight||$("delete-modal").classList.contains("open"))return;state.deletingJob={id:job.id,title:jobTitle(job)||job.filename||"未命名论文"};$("delete-name").textContent=state.deletingJob.title;msg("delete-msg","");open("delete-modal");}
-function clearDeletedJob(jobId){const id=String(jobId),oldJobs=state.jobs.slice(),deletedIndex=oldJobs.findIndex(job=>String(job.id)===id),deletingCurrent=state.job?.id!=null&&String(state.job.id)===id;state.deletedJobIds.add(id);state.jobsRequest++;state.selectRequest++;if(deletingCurrent&&state.timer){clearTimeout(state.timer);state.timer=null;}state.jobs=oldJobs.filter(job=>String(job.id)!==id);for(const cacheKey of Object.keys(state.docs)){if(cacheKey.startsWith(id+":"))disposeDocument(cacheKey);}for(const cacheKey of Object.keys(state.annotations)){if(cacheKey.startsWith(id+":"))delete state.annotations[cacheKey];}state.cacheJobOrder=state.cacheJobOrder.filter(cacheId=>String(cacheId)!==id);const deletedSelection=state.selection?.jobId!=null&&String(state.selection.jobId)===id;if(deletedSelection){state.selection=null;$("annotation-menu").classList.remove("open");}if(state.selectedAnnotation?.jobId!=null&&String(state.selectedAnnotation.jobId)===id)state.selectedAnnotation=null;if(state.undo?.jobId!=null&&String(state.undo.jobId)===id)state.undo=null;if(deletingCurrent){reader?.destroy();state.job=null;state.page=1;state.zoom=100;$("empty").hidden=false;$("pages").hidden=true;$("title").textContent="选择一篇论文";$("notice").textContent="";$("notice").classList.remove("show");$("progress-wrap").hidden=true;$("progress-stage").textContent="正在准备";$("progress-value").textContent="处理中";$("progress-fill").style.width="";$("token-usage").textContent="Token 未统计";$("status-text").textContent="就绪";$("page-number").value=1;$("total").textContent="—";$("zoom-label").textContent="100%";$("open-translate").disabled=true;$("open-download").disabled=true;const next=state.jobs[deletedIndex]||state.jobs[deletedIndex-1];return next?.id??null;}renderList();return null;}
+function clearDeletedJob(jobId){const id=String(jobId),oldJobs=state.jobs.slice(),deletedIndex=oldJobs.findIndex(job=>String(job.id)===id),deletingCurrent=state.job?.id!=null&&String(state.job.id)===id;state.deletedJobIds.add(id);state.jobsRequest++;state.selectRequest++;if(deletingCurrent&&state.timer){clearTimeout(state.timer);state.timer=null;}state.jobs=oldJobs.filter(job=>String(job.id)!==id);for(const cacheKey of Object.keys(state.docs)){if(cacheKey.startsWith(id+":"))disposeDocument(cacheKey);}for(const cacheKey of Object.keys(state.annotations)){if(cacheKey.startsWith(id+":"))delete state.annotations[cacheKey];}state.cacheJobOrder=state.cacheJobOrder.filter(cacheId=>String(cacheId)!==id);const deletedSelection=state.selection?.jobId!=null&&String(state.selection.jobId)===id;if(deletedSelection){state.selection=null;$("annotation-menu").classList.remove("open");}if(state.selectedAnnotation?.jobId!=null&&String(state.selectedAnnotation.jobId)===id)state.selectedAnnotation=null;if(state.undo?.jobId!=null&&String(state.undo.jobId)===id)state.undo=null;if(deletingCurrent){reader?.destroy();state.job=null;state.page=1;state.zoom=100;$("empty").hidden=false;$("pages").hidden=true;$("pagebar").hidden=true;$("title").textContent="选择一篇论文";$("notice").textContent="";$("notice").classList.remove("show");$("progress-wrap").hidden=true;$("progress-stage").textContent="正在准备";$("progress-value").textContent="处理中";$("progress-fill").style.width="";$("token-usage").textContent="Token 未统计";$("status-text").textContent="就绪";$("page-number").value=1;$("total").textContent="—";$("zoom-label").textContent="100%";$("open-translate").disabled=true;$("open-download").disabled=true;agentPanel.setPaper(null);const next=state.jobs[deletedIndex]||state.jobs[deletedIndex-1];return next?.id??null;}renderList();return null;}
 async function submitDelete(){const job=state.deletingJob;if(!job?.id||isDeletedJob(job.id)||state.deleteInFlight)return;const button=$("submit-delete");state.deleteInFlight=String(job.id);button.disabled=true;msg("delete-msg","正在移除文献库副本…");try{const result=await post("/api/jobs/"+path(job.id)+"/delete",{});const nextId=clearDeletedJob(job.id);state.deletingJob=null;state.deleteInFlight=null;close("delete-modal");state.library=result.library||await api("/api/library");await loadJobs(false);if(!state.job&&state.jobs.length)await select(nextId&&state.jobs.some(item=>String(item.id)===String(nextId))?nextId:state.jobs[0].id);renderList();msg("status","已从文献库移除，软件托管文件和记录已清理，外部原始 PDF 未删除。");}catch(error){msg("delete-msg",error.message||"删除失败","error");}finally{state.deleteInFlight=null;button.disabled=false;}}
 async function runFileMenuAction(action){const job=fileMenuJob;closeFileMenu();if(!job)return;if(action==="move"){moveDocument(job);return;}if(action==="delete"){deleteDocument(job);return;}if(action!=="copy-markdown")return;try{await copyMarkdownDirectory(job);showFileToast("Markdown 目录地址已复制");}catch(error){showFileToast(error.message||"目录地址复制失败","error");}}
 function renderList(){
@@ -86,25 +97,35 @@ function renderList(){
   const folders=state.library.folders||[],mapping=state.library.documents||{},jobs=state.jobs.filter(job=>!isDeletedJob(job.id));
   const rootTarget=document.createElement("div");
   rootTarget.className="library-root-drop";
-  rootTarget.textContent="根目录（拖到这里放回）";
   rootTarget.setAttribute("role","button");
-  rootTarget.setAttribute("aria-label","根目录，拖到这里放回论文");
+  rootTarget.setAttribute("aria-label","论文库根目录，拖到这里放回论文");
+  const rootIcon=iconSvg("library");rootIcon.classList.add("row-icon");
+  const rootLabel=document.createElement("span");rootLabel.className="row-label";rootLabel.textContent="论文库";
+  const rootCount=document.createElement("span");rootCount.className="root-count";rootCount.textContent=String(jobs.length);
+  rootTarget.append(rootIcon,rootLabel,rootCount);
   bindDocumentDropTarget(rootTarget,null);
   box.append(rootTarget);
   const addJob=(job,depth)=>{
     const row=document.createElement("div");
     row.className="file-row";
-    row.style.paddingLeft=(5+depth*14)+"px";
+    row.style.paddingLeft=(6+depth*14)+"px";
     row.draggable=true;
     const button=document.createElement("button");
+    button.type="button";
     button.className="file"+(state.job?.id===job.id?" active":"");
-    const name=document.createElement("strong");
-    name.append(iconSvg("file"),document.createTextNode(job.translated_title||job.display_title||job.filename||"未命名论文"));
-    name.title=job.filename||"";
-    const meta=document.createElement("small");
-    meta.textContent=label(job)+" · "+(job.page_count||"?")+" 页";
-    button.title=job.filename||"";
-    button.append(name,meta);
+    const icon=iconSvg("paper");icon.classList.add("row-icon");
+    const name=document.createElement("span");name.className="row-label";
+    name.textContent=jobTitle(job)||job.filename||"未命名论文";
+    button.append(icon,name);
+    const status=job.status;
+    if(status==="running"||status==="queued"||status==="failed"){
+      const dot=document.createElement("span");
+      dot.className="status-dot "+(status==="failed"?"failed":"running");
+      dot.title=label(job);
+      button.append(dot);
+    }
+    button.title=(job.filename||"")+" · "+label(job)+" · "+(job.page_count||"?")+" 页";
+    if(state.job?.id===job.id)row.classList.add("active");
     button.addEventListener("click",()=>{closeFileMenu(false);select(job.id);});
     button.addEventListener("contextmenu",event=>openFileMenu(event,job,button));
     button.addEventListener("keydown",event=>{if((event.key==="ContextMenu")||(event.shiftKey&&event.key==="F10")){event.preventDefault();openFileMenu(event,job,button);}});
@@ -123,38 +144,45 @@ function renderList(){
   };
   const walk=(parent,depth)=>{
     for(const folder of folders.filter(f=>f.parent_id===parent)){
+      const expanded=state.expanded.has(folder.id);
       const row=document.createElement("div");
-      row.className="folder-row";
-      row.style.paddingLeft=(5+depth*14)+"px";
+      row.className="folder-row"+(expanded?" is-open":"");
+      row.style.paddingLeft=(6+depth*14)+"px";
       const toggle=document.createElement("button");
+      toggle.type="button";
       toggle.className="folder-toggle";
-      toggle.append(iconSvg(state.expanded.has(folder.id)?"chevron-down":"chevron-right"),iconSvg("folder"),document.createTextNode(folder.name));
+      const disclosure=iconSvg(expanded?"chevron-down":"chevron-right");disclosure.classList.add("disclosure");
+      const folderIcon=iconSvg(expanded?"folder-open":"folder");folderIcon.classList.add("folder-glyph");
+      const folderName=document.createElement("span");folderName.className="row-label";folderName.textContent=folder.name;
+      toggle.append(disclosure,folderIcon,folderName);
       toggle.title=folder.name;
-      toggle.setAttribute("aria-expanded",String(state.expanded.has(folder.id)));
-      toggle.addEventListener("click",()=>{state.expanded.has(folder.id)?state.expanded.delete(folder.id):state.expanded.add(folder.id);renderList();});
+      toggle.setAttribute("aria-expanded",String(expanded));
+      toggle.addEventListener("click",()=>{expanded?state.expanded.delete(folder.id):state.expanded.add(folder.id);renderList();});
       row.append(toggle);
       bindDocumentDropTarget(row,folder.id);
       for(const [title,icon,action] of [["新建子文件夹","plus","create_folder"],["重命名","edit","rename_folder"],["移动文件夹","folder","move_folder"],["删除文件夹","trash","delete_folder"]]){
-        const button=document.createElement("button");
-        button.className="folder-action";
-        button.title=title;
-        button.setAttribute("aria-label",title);
-        button.append(iconSvg(icon));
-        button.addEventListener("click",event=>{event.stopPropagation();if(action==="delete_folder")deleteFolder(folder);else folderModal(action,folder.id,action==="create_folder"?folder.id:null);});
-        row.append(button);
+        const actionButton=document.createElement("button");
+        actionButton.type="button";
+        actionButton.className="folder-action";
+        actionButton.title=title;
+        actionButton.setAttribute("aria-label",title);
+        actionButton.append(iconSvg(icon));
+        actionButton.addEventListener("click",event=>{event.stopPropagation();if(action==="delete_folder")deleteFolder(folder);else folderModal(action,folder.id,action==="create_folder"?folder.id:null);});
+        row.append(actionButton);
       }
       box.append(row);
-      if(state.expanded.has(folder.id)){walk(folder.id,depth+1);for(const job of jobs.filter(j=>String(mapping[j.id])===String(folder.id)))addJob(job,depth+1);}
+      if(expanded){walk(folder.id,depth+1);for(const job of jobs.filter(j=>String(mapping[j.id])===String(folder.id)))addJob(job,depth+1);}
     }
   };
   walk(null,0);
   for(const job of jobs.filter(j=>!mapping[j.id]))addJob(job,0);
   if(!folders.length&&!jobs.length){const empty=document.createElement("div");empty.className="files-empty";empty.textContent="还没有论文。";box.append(empty);}
 }
+
 async function loadJobs(selectFirst=true){const request=++state.jobsRequest;try{const data=await api("/api/jobs");if(request!==state.jobsRequest)return;state.jobs=(data.jobs||[]).filter(job=>!isDeletedJob(job.id));renderList();if(selectFirst&&!state.job&&state.jobs.length)await select(state.jobs[0].id);}catch(error){if(request===state.jobsRequest)msg("status",error.message,"error");}}
-async function select(id){if(isDeletedJob(id))return;const request=++state.selectRequest;try{const job=await api("/api/jobs/"+path(id));if(request!==state.selectRequest||isDeletedJob(id)||isDeletedJob(job.id))return;const previousJobId=state.job?.id;if(previousJobId&&previousJobId!==job.id)reader?.destroy();state.job=job;touchCacheJob(job.id);trimJobCaches();state.page=1;state.zoom=100;state.view="compare";state.readerPreserve=false;state.selection=null;state.selectedAnnotation=null;state.undo=null;$("sidebar").classList.remove("open");renderList();showJob();poll();}catch(error){if(request===state.selectRequest&&!isDeletedJob(id))msg("status",error.message,"error");}}
+async function select(id){if(isDeletedJob(id))return;const request=++state.selectRequest;try{const job=await api("/api/jobs/"+path(id));if(request!==state.selectRequest||isDeletedJob(id)||isDeletedJob(job.id))return;const previousJobId=state.job?.id;if(previousJobId&&previousJobId!==job.id)reader?.destroy();state.job=job;agentPanel.setPaper(job);touchCacheJob(job.id);trimJobCaches();state.page=1;state.zoom=100;state.view="compare";state.readerPreserve=false;state.selection=null;state.selectedAnnotation=null;state.undo=null;$("sidebar").classList.remove("open");renderList();showJob();poll();}catch(error){if(request===state.selectRequest&&!isDeletedJob(id))msg("status",error.message,"error");}}
 function updateProgress(job){const active=job.status==="queued"||job.status==="running",wrap=$("progress-wrap"),value=$("progress-value"),fill=$("progress-fill");$("open-download").disabled=active||!hasTranslation(job);wrap.hidden=!active;if(!active)return;const number=Number(job.progress),known=Number.isFinite(number)&&job.progress!==null&&!job.progress_indeterminate;wrap.classList.toggle("indeterminate",!known);fill.style.width=known?Math.max(0,Math.min(100,number))+"%":"";$("progress-stage").textContent=job.message||({queued:"等待处理",running:"正在翻译"}[job.status]||"处理中");value.textContent=known?Math.round(number)+"%":"处理中";}
-function showJob(){const job=state.job;if(!job)return;$("title").textContent=job.translated_title||job.display_title||job.filename||"未命名论文";$("title").title=job.filename||"";const usage=job.token_usage;$("token-usage").textContent=usage?"Token 累计 "+Number(usage.total_tokens).toLocaleString()+" · 本次 "+Number(usage.last_run?.total_tokens||0).toLocaleString():"Token 未统计";$("total").textContent=job.page_count||"—";$("page-number").value=state.page;$("zoom-label").textContent=state.zoom+"%";$("open-translate").disabled=job.status==="queued"||job.status==="running";$("open-download").disabled=!hasTranslation(job);$("empty").hidden=true;$("pages").hidden=false;document.querySelectorAll("[data-view]").forEach(b=>b.classList.toggle("active",b.dataset.view===state.view));let note="";if(job.demo_mode&&hasTranslation(job))note="演示模式：译文是原文副本，未调用 API。";else if(job.status==="failed")note=job.error||"翻译失败，仍可阅读原文。";else if(!hasTranslation(job)&&job.status!=="queued"&&job.status!=="running")note="尚无译文。点击右上角“翻译”开始。";$("notice").textContent=note;$("notice").classList.toggle("show",Boolean(note));msg("status",job.status==="failed"?(job.error||"失败"):label(job),job.status==="failed"?"error":"");updateProgress(job);renderPage();}
+function showJob(){const job=state.job;if(!job)return;$("title").textContent=job.translated_title||job.display_title||job.filename||"未命名论文";$("title").title=job.filename||"";const usage=job.token_usage;$("token-usage").textContent=usage?"Token 累计 "+Number(usage.total_tokens).toLocaleString()+" · 本次 "+Number(usage.last_run?.total_tokens||0).toLocaleString():"Token 未统计";$("total").textContent=job.page_count||"—";$("page-number").value=state.page;$("zoom-label").textContent=state.zoom+"%";$("open-translate").disabled=job.status==="queued"||job.status==="running";$("open-download").disabled=!hasTranslation(job);$("empty").hidden=true;$("pages").hidden=false;$("pagebar").hidden=false;document.querySelectorAll("[data-view]").forEach(b=>b.classList.toggle("active",b.dataset.view===state.view));let note="";if(job.demo_mode&&hasTranslation(job))note="演示模式：译文是原文副本，未调用 API。";else if(job.status==="failed")note=job.error||"翻译失败，仍可阅读原文。";else if(!hasTranslation(job)&&job.status!=="queued"&&job.status!=="running")note="尚无译文。点击右上角“翻译”开始。";$("notice").textContent=note;$("notice").classList.toggle("show",Boolean(note));msg("status",job.status==="failed"?(job.error||"失败"):label(job),job.status==="failed"?"error":"");updateProgress(job);renderPage();}
 function touchCacheJob(jobId){state.cacheJobOrder=state.cacheJobOrder.filter(id=>id!==jobId);state.cacheJobOrder.unshift(jobId);}
 function disposeDocument(cacheKey){const promise=state.docs[cacheKey];if(!promise)return;delete state.docs[cacheKey];Promise.resolve(promise).then(doc=>doc?.destroy?.()).catch(()=>{});}
 function trimJobCaches(){const keep=new Set(state.cacheJobOrder.slice(0,3));if(state.job?.id)keep.add(state.job.id);for(const cacheKey of Object.keys(state.docs)){const jobId=cacheKey.slice(0,cacheKey.lastIndexOf(":"));if(!keep.has(jobId)&&jobId!==state.job?.id)disposeDocument(cacheKey);}for(const cacheKey of Object.keys(state.annotations)){const jobId=cacheKey.slice(0,cacheKey.lastIndexOf(":"));if(!keep.has(jobId)&&jobId!==state.job?.id)delete state.annotations[cacheKey];}state.cacheJobOrder=state.cacheJobOrder.filter(id=>keep.has(id));}
@@ -210,5 +238,5 @@ $("scroll").addEventListener("wheel",event=>{if(!event.ctrlKey||!state.job)retur
 $("submit-folder-delete").addEventListener("click",submitFolderDelete);
 $("file-input").addEventListener("change",event=>chooseFiles(event.target.files));
 $("open-import").addEventListener("click",openImportModal);
-initSidebar();reader=new ContinuousReader({scroller:$("scroll"),pages:$("pages"),getDocument:documentFor,getAnnotations:annotationsFor,onPageChange:pageNumber=>{state.page=pageNumber;$("page-number").value=pageNumber;},onSelection:handleReaderSelection,onSelectionError:handleReaderSelectionError,onAnnotationClick:handleReaderAnnotationClick,onError:handleReaderError});
+initSidebar();initAgent();const agentPanel=createAgentPanel({getJob:()=>state.job,getPage:()=>state.page});reader=new ContinuousReader({scroller:$("scroll"),pages:$("pages"),getDocument:documentFor,getAnnotations:annotationsFor,onPageChange:pageNumber=>{state.page=pageNumber;$("page-number").value=pageNumber;agentPanel.setPage(pageNumber);},onSelection:handleReaderSelection,onSelectionError:handleReaderSelectionError,onAnnotationClick:handleReaderAnnotationClick,onError:handleReaderError});
 importOptions();translateOptions();loadSettings();loadLibrary().then(loadJobs);

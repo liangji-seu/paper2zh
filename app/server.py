@@ -22,6 +22,7 @@ from .annotations import (
     export_annotated,
     get_annotations,
 )
+from . import agent
 from .core import DATA, JOBS, MAX_UPLOAD_BYTES, create_job, create_job_from_path, file_path, get_workspace_preferences, list_jobs, load_job, public_settings, read_settings, render_page, save_settings, save_workspace_preferences, translate_job
 from .library import MAX_LIBRARY_BODY_BYTES, apply_action, get_library
 from .markdown_export import MarkdownExportError, markdown_directory
@@ -199,6 +200,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/workspace-preferences":
             self._json(200, get_workspace_preferences())
             return
+        if path == "/api/agent/info":
+            self._json(200, agent.info())
+            return
         if path == "/api/diagnostics/download":
             payload = export_bytes()
             self._send(200, payload, "application/zip", {"Content-Disposition": 'attachment; filename="paper2zh-diagnostics.zip"'})
@@ -325,6 +329,31 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             return
 
+    def _stream_agent(self, payload: dict[str, object]) -> None:
+        """Relay one Claude Code turn as server-sent events."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        job_id = payload.get("job_id")
+        job_id = job_id if isinstance(job_id, str) and job_id else None
+        try:
+            for event in agent.stream_chat(payload):
+                self.wfile.write(b"data: " + json_bytes(event) + b"\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            agent.cancel(job_id)
+        except Exception as exc:
+            diagnostic_exception("agent_stream_failed", exc, fields={"phase": "stream"})
+            try:
+                self.wfile.write(b"data: " + json_bytes({"type": "error", "message": f"助手运行失败：{exc}"}) + b"\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         try:
@@ -333,8 +362,30 @@ class Handler(BaseHTTPRequestHandler):
             route_parts = [x for x in path.split("/") if x]
             annotation_route = len(route_parts) == 5 and route_parts[:2] == ["api", "jobs"] and route_parts[3] in {"source", "translated"} and route_parts[4] == "annotations"
             local_import_route = path == "/api/jobs/import-local"
-            body_limit = MAX_ANNOTATION_BODY_BYTES if annotation_route else MAX_LIBRARY_BODY_BYTES if path == "/api/library" else 64 * 1024 if local_import_route else MAX_CLIENT_ERROR_BYTES if path == "/api/diagnostics/client-error" else None
+            agent_route = path in {"/api/agent/chat", "/api/agent/cancel", "/api/agent/reset"}
+            body_limit = MAX_ANNOTATION_BODY_BYTES if annotation_route else MAX_LIBRARY_BODY_BYTES if path == "/api/library" else 32 * 1024 if agent_route else 64 * 1024 if local_import_route else MAX_CLIENT_ERROR_BYTES if path == "/api/diagnostics/client-error" else None
             body = self._read_body(body_limit)
+            if path == "/api/agent/chat":
+                if request_content_type.split(";", 1)[0].strip().lower() != "application/json":
+                    raise ValueError("助手请求必须使用 application/json。")
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                if not isinstance(payload, dict):
+                    raise ValueError("助手请求格式无效。")
+                self._stream_agent(payload)
+                return
+            if path in {"/api/agent/cancel", "/api/agent/reset"}:
+                if request_content_type.split(";", 1)[0].strip().lower() != "application/json":
+                    raise ValueError("助手请求必须使用 application/json。")
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                if not isinstance(payload, dict):
+                    raise ValueError("助手请求格式无效。")
+                job_id = payload.get("job_id")
+                job_id = job_id if isinstance(job_id, str) and job_id else None
+                if path == "/api/agent/cancel":
+                    self._json(200, agent.cancel(job_id))
+                else:
+                    self._json(200, agent.reset(job_id))
+                return
             if local_import_route:
                 if self.headers.get("X-Paper-Translator-Desktop") != "1":
                     raise ValueError("本地路径导入只接受桌面原生文件选择桥。")
