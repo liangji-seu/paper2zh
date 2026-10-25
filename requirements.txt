@@ -1,3 +1,6 @@
 pypdf>=5.0
-PyMuPDF>=1.24
+# PyMuPDF 2.x activates its layout analyzer on import and needs ONNX model
+# resources that PyInstaller does not bundle; paper2zh only needs the base PDF
+# bindings, so stay on 1.x for the frozen desktop build.
+PyMuPDF>=1.24,<2
 cryptography>=42.0
