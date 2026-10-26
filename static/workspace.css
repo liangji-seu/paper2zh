@@ -6,6 +6,8 @@
   --bg:#fbfbfc;
   --panel:#ffffff;
   --sidebar:#f4f5f7;
+  --folder-bg:color-mix(in srgb,var(--brand) 8%,var(--sidebar));
+  --folder-hover:color-mix(in srgb,var(--brand) 14%,var(--sidebar));
   --reader-bg:#ecedf0;
   --hover:#e9eaee;
   --pressed:#e1e2e7;
@@ -39,6 +41,8 @@
     --bg:#0f0f11;
     --panel:#19191c;
     --sidebar:#131315;
+  --folder-bg:color-mix(in srgb,var(--brand) 14%,var(--sidebar));
+  --folder-hover:color-mix(in srgb,var(--brand) 22%,var(--sidebar));
     --reader-bg:#0a0a0b;
     --hover:#232327;
     --pressed:#2a2a2f;
@@ -139,7 +143,9 @@ aside.sidebar{
 .library-root-drop .root-count{margin-left:auto;font-size:11px;font-weight:400;color:var(--muted);font-variant-numeric:tabular-nums}
 
 .folder-row,.file-row{display:flex;align-items:center;min-width:0;border-radius:6px}
-.folder-row:hover,.file-row:hover{background:var(--hover)}
+.folder-row{background:var(--folder-bg)}
+.folder-row:hover{background:var(--folder-hover)}
+.file-row:hover{background:var(--hover)}
 .folder-row.drop-target,.library-root-drop.drop-target{
   background:color-mix(in srgb,var(--brand) 12%,transparent);
   border-color:color-mix(in srgb,var(--brand) 45%,transparent);
