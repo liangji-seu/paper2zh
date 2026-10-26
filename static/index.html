@@ -52,6 +52,10 @@
           <span id="selection-count"></span>
           <button type="button" id="selection-clear" title="取消选择">取消</button>
         </div>
+        <button id="open-memo" class="btn memo-btn" disabled title="阅读备忘录" aria-label="阅读备忘录">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 1.8h9v12.4h-9z"/><path d="M5.7 5h4.6M5.7 7.5h4.6M5.7 10h3"/></svg>
+          <span class="btn-label">备忘</span>
+        </button>
         <button id="open-translate" class="btn" disabled title="翻译" aria-label="翻译">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4h6M5 2v2c0 2-1.5 3.5-3.5 4.5M8.5 4c0 2 1.5 3.5 3.5 4.5"/><path d="m9.5 13.5 2-5 2 5M10.2 12h2.6"/></svg>
           <span class="btn-label" id="translate-label">翻译</span>
@@ -198,6 +202,16 @@
     <div class="msg" id="import-msg"></div>
     <div class="msg" id="import-summary" hidden></div>
     <div class="actions"><button data-close="import-modal">取消</button><button class="primary" id="submit-import">导入</button></div>
+  </div>
+</div>
+<div class="backdrop" id="memo-modal">
+  <div class="modal memo-modal">
+    <button class="close" data-close="memo-modal">×</button>
+    <h2>阅读备忘录</h2>
+    <p class="help" id="memo-paper"></p>
+    <textarea id="memo-content" class="memo-editor" placeholder="记录这篇论文的要点、疑问或复现笔记…支持 Markdown。" aria-label="备忘录内容"></textarea>
+    <div class="memo-meta"><span class="msg" id="memo-status"></span><span class="memo-hint">Ctrl+Enter 保存</span></div>
+    <div class="actions"><button data-close="memo-modal">取消</button><button class="primary" id="save-memo">保存备忘录</button></div>
   </div>
 </div>
 <div class="backdrop" id="batch-translate-modal">

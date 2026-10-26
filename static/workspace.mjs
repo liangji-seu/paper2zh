@@ -6,7 +6,7 @@ import {createAgentPanel} from "/static/agent-panel.mjs";
 import {selectionAfterClick,chunks,pendingTranslationIds} from "/static/library-selection.mjs";
 pdfjs.GlobalWorkerOptions.workerSrc = "/static/vendor/pdfjs/pdf.worker.mjs";
 const $=id=>document.getElementById(id);
-const state={jobs:[],job:null,file:null,files:[],importInFlight:false,page:1,zoom:100,view:"compare",timer:null,docs:{},annotations:{},cacheJobOrder:[],selection:null,selectedAnnotation:null,undo:null,readerPreserve:true,selectRequest:0,jobsRequest:0,deletedJobIds:new Set(),library:{folders:[],documents:{}},expanded:new Set(),folderEdit:null,movingJob:null,movingJobs:null,deletingJob:null,deleteInFlight:null,deletingFolder:null,folderDeleteInFlight:null,folderDeleteRequest:0,draggingJob:null,draggingJobs:[],dragMoveInFlight:null,dragRenderPending:false,dropFolderId:undefined,selectedJobIds:new Set(),selectionAnchor:null,visibleJobIds:[],batch:null,batchFinished:new Set()};
+const state={jobs:[],job:null,file:null,files:[],importInFlight:false,page:1,zoom:100,view:"compare",timer:null,docs:{},annotations:{},cacheJobOrder:[],selection:null,selectedAnnotation:null,undo:null,readerPreserve:true,selectRequest:0,jobsRequest:0,deletedJobIds:new Set(),library:{folders:[],documents:{}},expanded:new Set(),folderEdit:null,movingJob:null,movingJobs:null,deletingJob:null,deleteInFlight:null,deletingFolder:null,folderDeleteInFlight:null,folderDeleteRequest:0,draggingJob:null,draggingJobs:[],dragMoveInFlight:null,dragRenderPending:false,dropFolderId:undefined,selectedJobIds:new Set(),selectionAnchor:null,visibleJobIds:[],batch:null,batchFinished:new Set(),memoJobId:null,memoOriginal:null,memoSaving:false};
 const key=(side,jobId=state.job?.id)=>String(jobId)+":"+side;
 const path=id=>encodeURIComponent(String(id));
 let reader;
@@ -39,7 +39,7 @@ function initAgent(){const savedWidth=Number(readPreference(agentKeys.width,360)
 function msg(id,text,kind=""){if(id==="status"){$("status-text").textContent=text;$("status").className="status"+(kind?" "+kind:"");return;}const el=$(id);el.textContent=text;el.className="msg"+(kind?" "+kind:"");}
 function reportClientError(context={}){const payload={event:context.event||"pdf_preview_failed"};for(const key of ["pdf","page","job_id"]){if(context[key]!==undefined)payload[key]=context[key];}try{fetch("/api/diagnostics/client-error",{method:"POST",headers:{"Content-Type":"application/json","X-Paper-Translator":"1"},body:JSON.stringify(payload),keepalive:true}).catch(()=>{});}catch(_error){}}
 function open(id){if(id==="import-modal"&&state.importInFlight)return;const modal=$(id);modal.classList.add("open");if(id==="delete-modal")$("delete-cancel")?.focus?.();if(id==="folder-delete-modal")$("folder-delete-cancel")?.focus?.();if(id==="settings-modal")loadSettings();}
-function close(id,internal=false){if(id==="import-modal"&&state.importInFlight&&!internal)return;if(id==="delete-modal"&&state.deleteInFlight)return;if(id==="folder-delete-modal"&&state.folderDeleteInFlight)return;$(id).classList.remove("open");if(id==="delete-modal")state.deletingJob=null;if(id==="folder-delete-modal")state.deletingFolder=null;}
+function close(id,internal=false){if(id==="import-modal"&&state.importInFlight&&!internal)return;if(id==="delete-modal"&&state.deleteInFlight)return;if(id==="folder-delete-modal"&&state.folderDeleteInFlight)return;if(id==="memo-modal"&&!internal&&state.memoOriginal!==null&&$("memo-content").value!==state.memoOriginal){if(!window.confirm("备忘录还没有保存，确定关闭吗？"))return;}$(id).classList.remove("open");if(id==="delete-modal")state.deletingJob=null;if(id==="folder-delete-modal")state.deletingFolder=null;if(id==="memo-modal"){state.memoJobId=null;state.memoOriginal=null;}}
 async function api(url,options={}){const headers=new Headers(options.headers||{});if(options.method&&options.method!=="GET")headers.set("X-Paper-Translator","1");const response=await fetch(url,{...options,headers});const data=await response.json();if(!response.ok)throw Error(data.error||"请求失败");return data;}
 function post(url,data){return api(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});}
 function label(job){if(job.status==="completed")return job.demo_mode?"演示完成":"翻译完成";if(job.status==="failed")return "失败";if(job.status==="running")return "翻译中";if(job.status==="queued")return "等待处理";return "已导入";}
@@ -265,6 +265,50 @@ function renderList(){
   updateActions();
 }
 
+async function openMemo(){
+  const job=state.job;
+  if(!job)return;
+  const jobId=String(job.id);
+  state.memoJobId=jobId;state.memoOriginal=null;
+  $("memo-paper").textContent=jobTitle(job)||job.filename||"当前论文";
+  $("memo-content").value="";
+  $("memo-status").textContent="正在读取…";$("memo-status").className="msg";
+  $("save-memo").disabled=true;
+  open("memo-modal");
+  try{
+    const data=await api("/api/jobs/"+path(jobId)+"/memo");
+    if(state.memoJobId!==jobId)return;
+    const content=String(data.content||"");
+    $("memo-content").value=content;state.memoOriginal=content;
+    $("memo-status").textContent=data.updated_at?("上次保存："+new Date(data.updated_at).toLocaleString()):"还没有备忘录";
+    $("save-memo").disabled=false;
+    $("memo-content").focus();
+  }catch(error){
+    if(state.memoJobId!==jobId)return;
+    state.memoOriginal="";
+    $("memo-status").textContent=error.message||"备忘录读取失败";$("memo-status").className="msg error";
+    $("save-memo").disabled=false;
+  }
+}
+async function saveMemo(){
+  const jobId=state.memoJobId;
+  if(!jobId||state.memoSaving)return;
+  const content=$("memo-content").value;
+  if(content.length>200000){$("memo-status").textContent="备忘录过长，请控制在 20 万字以内。";$("memo-status").className="msg error";return;}
+  const button=$("save-memo");button.disabled=true;state.memoSaving=true;
+  $("memo-status").textContent="正在保存…";$("memo-status").className="msg";
+  try{
+    const data=await post("/api/jobs/"+path(jobId)+"/memo",{content});
+    if(state.memoJobId!==jobId)return;
+    state.memoOriginal=content;
+    $("memo-status").textContent="已保存 "+new Date(data.updated_at||Date.now()).toLocaleString();
+    $("memo-status").className="msg ok";
+    showFileToast("备忘录已保存");
+    close("memo-modal");
+  }catch(error){
+    $("memo-status").textContent=error.message||"备忘录保存失败";$("memo-status").className="msg error";
+  }finally{state.memoSaving=false;button.disabled=false;}
+}
 function updateActions(){
   const count=state.selectedJobIds?.size||0;
   const multi=count>1;
@@ -277,6 +321,8 @@ function updateActions(){
   if(translate)translate.disabled=busy||(multi?false:(!state.job||["queued","running"].includes(state.job.status)));
   const download=$("open-download");
   if(download)download.disabled=multi||!state.job||!hasTranslation(state.job);
+  const memo=$("open-memo");
+  if(memo)memo.disabled=!state.job;
 }
 function clearSelection(){if(!state.selectedJobIds?.size)return;state.selectedJobIds.clear();state.selectionAnchor=null;renderList();updateActions();}
 function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
@@ -481,7 +527,7 @@ function movePan(event){if(!panState.dragging||event.pointerId!==panState.pointe
 function endPan(){if(!panState.dragging){releasePanPointer();return;}panState.dragging=false;releasePanPointer();$("scroll").classList.remove("is-panning");window.getSelection()?.removeAllRanges();}
 async function addAnnotation(type,color){const selected=state.selection;if(!selected||!state.job||selected.jobId!==state.job.id)return;try{const current=await annotationsFor(selected.jobId,selected.side);if(state.job?.id!==selected.jobId)return;const result=await post("/api/jobs/"+path(selected.jobId)+"/"+selected.side+"/annotations",{action:"add",revision:current.revision,page:selected.page,type,color,rects:selected.rects});state.annotations[key(selected.side,selected.jobId)]=Promise.resolve(result);if(state.job?.id!==selected.jobId)return;const before=new Set((current.annotations||[]).map(x=>x.id));const added=(result.annotations||[]).find(x=>!before.has(x.id));if(added)state.undo={jobId:selected.jobId,side:selected.side,page:selected.page,id:added.id};state.selectedAnnotation=null;reader?.redrawAnnotations(selected.jobId,selected.side,selected.page,result.annotations||[]);$("annotation-menu").classList.remove("open");window.getSelection()?.removeAllRanges();state.selection=null;msg("status","批注已保存到本机。");}catch(error){if(state.job?.id===selected.jobId)msg("status",error.message,"error");}}
 async function deleteAnnotation(target){if(!target||!state.job||target.jobId!==state.job.id)return;try{const current=await annotationsFor(target.jobId,target.side);if(state.job?.id!==target.jobId)return;const result=await post("/api/jobs/"+path(target.jobId)+"/"+target.side+"/annotations",{action:"delete",revision:current.revision,id:target.id});state.annotations[key(target.side,target.jobId)]=Promise.resolve(result);if(state.job?.id!==target.jobId)return;reader?.redrawAnnotations(target.jobId,target.side,target.page,result.annotations||[]);state.selectedAnnotation=null;state.undo=null;msg("status","批注已删除。");}catch(error){if(state.job?.id===target.jobId)msg("status",error.message,"error");}}
-$("new-folder").addEventListener("click",()=>folderModal("create_folder"));$("submit-folder").addEventListener("click",submitFolder);$("submit-move").addEventListener("click",submitMove);$("open-import").addEventListener("click",()=>open("import-modal"));$("open-settings").addEventListener("click",()=>open("settings-modal"));$("open-translate").addEventListener("click",async()=>{if(state.batch?.active)return;const selected=[...state.selectedJobIds];if(selected.length>1){openBatchTranslate(selected);return;}if(selected.length===1&&String(selected[0])!==String(state.job?.id))await select(selected[0]);if(!state.job)return;$("translate-name").textContent=state.job.filename;open("translate-modal");});$("selection-clear").addEventListener("click",clearSelection);$("submit-batch-translate").addEventListener("click",submitBatchTranslate);$("pick-folder").addEventListener("click",pickFolder);$("folder-input").addEventListener("change",event=>{chooseFolderFiles(event.target.files);event.target.value="";});$("open-download").addEventListener("click",downloads);$("download-diagnostics").addEventListener("click",downloadDiagnostics);$("menu").addEventListener("click",()=>$("sidebar").classList.toggle("open"));
+$("new-folder").addEventListener("click",()=>folderModal("create_folder"));$("submit-folder").addEventListener("click",submitFolder);$("submit-move").addEventListener("click",submitMove);$("open-import").addEventListener("click",()=>open("import-modal"));$("open-settings").addEventListener("click",()=>open("settings-modal"));$("open-translate").addEventListener("click",async()=>{if(state.batch?.active)return;const selected=[...state.selectedJobIds];if(selected.length>1){openBatchTranslate(selected);return;}if(selected.length===1&&String(selected[0])!==String(state.job?.id))await select(selected[0]);if(!state.job)return;$("translate-name").textContent=state.job.filename;open("translate-modal");});$("open-memo").addEventListener("click",()=>void openMemo());$("save-memo").addEventListener("click",()=>void saveMemo());$("memo-content").addEventListener("keydown",event=>{if((event.ctrlKey||event.metaKey)&&event.key==="Enter"){event.preventDefault();void saveMemo();}});$("selection-clear").addEventListener("click",clearSelection);$("submit-batch-translate").addEventListener("click",submitBatchTranslate);$("pick-folder").addEventListener("click",pickFolder);$("folder-input").addEventListener("change",event=>{chooseFolderFiles(event.target.files);event.target.value="";});$("open-download").addEventListener("click",downloads);$("download-diagnostics").addEventListener("click",downloadDiagnostics);$("menu").addEventListener("click",()=>$("sidebar").classList.toggle("open"));
 $("pick-file").addEventListener("click",()=>window.pywebview?.api?.import_pdf?submitImport():$("file-input").click());$("file-input").addEventListener("change",event=>choose(event.target.files[0]));$("import-action").addEventListener("change",importOptions);$("import-mode").addEventListener("change",importOptions);$("submit-import").addEventListener("click",submitImport);$("translate-mode").addEventListener("change",translateOptions);$("submit-translate").addEventListener("click",submitTranslate);$("save-settings").addEventListener("click",saveSettings);$("test-connection").addEventListener("click",testConnection);
 document.querySelectorAll("[data-close]").forEach(b=>b.addEventListener("click",()=>close(b.dataset.close)));$("submit-delete").addEventListener("click",submitDelete);document.querySelectorAll(".backdrop").forEach(b=>b.addEventListener("click",e=>{if(e.target===b)close(b.id);}));document.querySelectorAll("[data-file-action]").forEach(button=>button.addEventListener("click",()=>runFileMenuAction(button.dataset.fileAction)));document.querySelectorAll("[data-menu-icon]").forEach(icon=>{icon.innerHTML=uiIcons[icon.dataset.menuIcon]||"";});document.addEventListener("keydown",e=>{if($("file-context-menu").classList.contains("open")){const items=[...$("file-context-menu").querySelectorAll("[role=menuitem]")],index=items.indexOf(document.activeElement);if(e.key==="Escape"){e.preventDefault();closeFileMenu();return;}if(e.key==="ArrowDown"||e.key==="ArrowUp"){e.preventDefault();items[(index+(e.key==="ArrowDown"?1:-1)+items.length)%items.length]?.focus();return;}if(e.key==="Home"||e.key==="End"){e.preventDefault();items[e.key==="Home"?0:items.length-1]?.focus();return;}if(e.key==="Enter"||e.key===" "){if(index>=0){e.preventDefault();items[index].click();return;}}}if(e.key==="Escape"){$("annotation-menu").classList.remove("open");document.querySelectorAll(".backdrop.open").forEach(b=>close(b.id));if(state.selectedJobIds.size)clearSelection();}if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="a"&&!isTypingTarget(e.target)&&!document.querySelector(".backdrop.open")){e.preventDefault();state.selectedJobIds=new Set(state.visibleJobIds);state.selectionAnchor=state.visibleJobIds[0]||null;renderList();updateActions();return;}if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="o"){e.preventDefault();open("import-modal");}});document.addEventListener("pointerdown",event=>{if($("file-context-menu").classList.contains("open")&&!$("file-context-menu").contains(event.target)&&!event.target.closest?.(".file-menu-trigger,.file"))closeFileMenu(false);if(!$("annotation-menu").contains(event.target))$("annotation-menu").classList.remove("open");});
 document.addEventListener("keydown",event=>{if(event.code!=="Space"||event.isComposing||isTypingTarget(event.target))return;if(event.repeat){if(panState.space)event.preventDefault();return;}event.preventDefault();panState.space=true;$("scroll").classList.add("space-pan");});document.addEventListener("keyup",event=>{if(event.code==="Space")clearPan();});window.addEventListener("blur",clearPan);$("scroll").addEventListener("pointerdown",startPan);$("scroll").addEventListener("pointermove",movePan);$("scroll").addEventListener("pointerup",endPan);$("scroll").addEventListener("pointercancel",endPan);$("scroll").addEventListener("lostpointercapture",endPan);

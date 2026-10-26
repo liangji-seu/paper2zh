@@ -25,6 +25,7 @@ from .annotations import (
 from . import agent
 from .core import DATA, JOBS, MAX_UPLOAD_BYTES, create_job, create_job_from_path, file_path, get_workspace_preferences, list_jobs, load_job, public_settings, read_settings, recover_interrupted_jobs, render_page, save_settings, save_workspace_preferences, translate_job
 from .library import MAX_LIBRARY_BODY_BYTES, apply_action, get_library
+from .memo import read_memo, save_memo
 from .markdown_export import MarkdownExportError, markdown_directory
 from .diagnostics import MAX_CLIENT_ERROR_BYTES, client_error, export_bytes, record_exception as diagnostic_exception
 
@@ -217,6 +218,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json(200, {"directory": str(directory)})
             return
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "jobs" and parts[3] == "memo":
+            try:
+                self._json(200, read_memo(parts[2]))
+            except FileNotFoundError as exc:
+                self._json(404, {"error": str(exc)})
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
+            except OSError as exc:
+                self._json(500, {"error": str(exc)})
+            return
         if len(parts) == 3 and parts[0] == "api" and parts[1] == "jobs":
             job = load_job(parts[2])
             if not job:
@@ -363,8 +374,22 @@ class Handler(BaseHTTPRequestHandler):
             annotation_route = len(route_parts) == 5 and route_parts[:2] == ["api", "jobs"] and route_parts[3] in {"source", "translated"} and route_parts[4] == "annotations"
             local_import_route = path == "/api/jobs/import-local"
             agent_route = path in {"/api/agent/chat", "/api/agent/cancel", "/api/agent/reset"}
-            body_limit = MAX_ANNOTATION_BODY_BYTES if annotation_route else MAX_LIBRARY_BODY_BYTES if path == "/api/library" else 32 * 1024 if agent_route else 64 * 1024 if local_import_route else MAX_CLIENT_ERROR_BYTES if path == "/api/diagnostics/client-error" else None
+            memo_route = len(route_parts) == 4 and route_parts[:2] == ["api", "jobs"] and route_parts[3] == "memo"
+            body_limit = MAX_ANNOTATION_BODY_BYTES if annotation_route else MAX_LIBRARY_BODY_BYTES if path == "/api/library" else 32 * 1024 if agent_route else 1024 * 1024 if memo_route else 64 * 1024 if local_import_route else MAX_CLIENT_ERROR_BYTES if path == "/api/diagnostics/client-error" else None
             body = self._read_body(body_limit)
+            if memo_route:
+                if request_content_type.split(";", 1)[0].strip().lower() != "application/json":
+                    raise ValueError("备忘录必须使用 application/json。")
+                payload = json.loads(body.decode("utf-8")) if body else {}
+                if not isinstance(payload, dict):
+                    raise ValueError("备忘录格式无效。")
+                try:
+                    self._json(200, save_memo(route_parts[2], payload.get("content", "")))
+                except FileNotFoundError as exc:
+                    self._json(404, {"error": str(exc)})
+                except ValueError as exc:
+                    self._json(400, {"error": str(exc)})
+                return
             if path == "/api/agent/chat":
                 if request_content_type.split(";", 1)[0].strip().lower() != "application/json":
                     raise ValueError("助手请求必须使用 application/json。")

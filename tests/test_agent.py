@@ -76,6 +76,7 @@ class AgentContextTests(unittest.TestCase):
         markdown.mkdir(parents=True)
         (markdown / "source.md").write_text("# Paper\n\n## 第 1 页\n\nOriginal body.\n", encoding="utf-8")
         (markdown / "translated.md").write_text("# 论文\n\n## 第 1 页\n\n中文正文。\n", encoding="utf-8")
+        (markdown / "notes.md").write_text("# 我的备忘\n\n重点：融合 sEMG。\n", encoding="utf-8")
         return markdown
 
     def test_workspace_contains_page_anchored_source_and_translation(self):
@@ -91,6 +92,7 @@ class AgentContextTests(unittest.TestCase):
                 self.assertIn("## 第 1 页", paper)
                 self.assertIn("示例论文", paper)
                 self.assertIn("中文正文", (cwd / "translation.md").read_text(encoding="utf-8"))
+                self.assertIn("融合 sEMG", (cwd / "notes.md").read_text(encoding="utf-8"))
                 info = (cwd / "info.md").read_text(encoding="utf-8")
                 self.assertIn("paper.pdf", info)
                 first = (cwd / "paper.md").stat().st_mtime_ns

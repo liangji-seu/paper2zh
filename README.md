@@ -8,7 +8,7 @@ paper2zh 在本机浏览器中管理和阅读 PDF。左侧可按嵌套文件夹�
 
 ## 安装桌面版
 
-从 [当前公开发布页](https://github.com/liangji-seu/paper2zh/releases/latest)下载 Windows 安装包；当前源码版本为 `v1.2.0`。安装程序默认安装在 `E:\paper2zh`，无需管理员权限；系统需要 Microsoft WebView2 运行时。桌面版附带独立 Python 3.11 与 BabelDOC 依赖，不要求系统安装 Python。首次翻译可能下载模型、字体等资源，请保持网络连接。
+从 [当前公开发布页](https://github.com/liangji-seu/paper2zh/releases/latest)下载 Windows 安装包；当前源码版本为 `v1.3.0`。安装程序默认安装在 `E:\paper2zh`，无需管理员权限；系统需要 Microsoft WebView2 运行时。桌面版附带独立 Python 3.11 与 BabelDOC 依赖，不要求系统安装 Python。首次翻译可能下载模型、字体等资源，请保持网络连接。
 
 桌面版使用系统文件窗口选择 PDF。文献、译文、批注及 SQLite 索引保存在安装目录的 `library/` 中，默认路径为 `E:\paper2zh\library`。升级后首次打开会复制旧 `%LOCALAPPDATA%\paper2zh` 中的文献与文件夹记录，旧目录保留。API 配置和已有模型缓存继续使用原用户目录；API Key 由当前 Windows 用户的 DPAPI 加密。安装包不包含用户论文、数据库、Markdown、Key、批注或模型缓存。源码开发版继续使用独立的 `data/`。
 
@@ -37,6 +37,13 @@ paper2zh 在本机浏览器中管理和阅读 PDF。左侧可按嵌套文件夹�
 双击 启动阅读器.bat，打开 http://127.0.0.1:8765 。首次安装翻译引擎时运行 安装BabelDOC.ps1；它将 BabelDOC 0.6.4 及完整依赖安装到项目隔离环境。启动脚本优先寻找 Python 3.11 与 .runtime311。
 
 在左侧底部“API 设置”中填写 Provider、Base URL、模型和 API Key，先保存再点“测试连接”。测试连接会向所设服务发送一次最小请求。默认配置使用 DeepSeek 的 OpenAI 兼容接口 https://api.deepseek.com 与 deepseek-v4-flash；在官方 DeepSeek 接口进行 BabelDOC 翻译时，程序明确关闭默认思考模式，以免推理内容耗尽译文输出预算。其他兼容服务不发送该专有参数。
+
+## 阅读备忘录
+
+- 顶部“备忘”按钮打开当前论文的 Markdown 备忘录，记录要点、疑问或复现笔记；`Ctrl+Enter` 保存。
+- 内容保存为 `library/jobs/<文献ID>/markdown/notes.md`，与 `source.md`、`translated.md` 放在一起；重新生成译文 Markdown 时会保留该文件。
+- 备忘录会作为 `notes.md` 提供给右侧 Claude Code 助手，可在提问时引用你记录的重点。
+- 备忘录属于文献库数据，删除文献时一并删除；关闭未保存的备忘录会先确认。
 
 ## 批量操作
 

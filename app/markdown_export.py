@@ -358,6 +358,13 @@ def _atomic_write(path: Path, content: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _preserve_user_notes(target: Path, staging: Path) -> None:
+    """Keep the user's memo when generated Markdown replaces the bundle."""
+    note = target / "notes.md"
+    if note.is_file():
+        shutil.copy2(note, staging / "notes.md")
+
+
 def _atomic_publish(directory: Path, target: Path) -> None:
     backup: Path | None = None
     published = False
@@ -437,6 +444,7 @@ def export_job(data: str | os.PathLike[str], jobs: str | os.PathLike[str], job: 
         (temporary / "source.md").write_text(_markdown_for_pages(pages=all_pages, extracted=source_text, pdf_path=source, markdown_dir=temporary, label="Source"), encoding="utf-8", newline="\n")
         (temporary / "translated.md").write_text(_markdown_for_pages(pages=selected, extracted=translated_text, pdf_path=translated if translated and translated.is_file() else None, markdown_dir=temporary, label="Translated"), encoding="utf-8", newline="\n")
         (temporary / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+        _preserve_user_notes(target, temporary)
         _atomic_publish(temporary, target)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)

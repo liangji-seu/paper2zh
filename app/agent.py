@@ -283,6 +283,14 @@ def _build_job_workspace(job: dict[str, Any]) -> Path:
         ]
     )
     _write_if_changed(directory / "info.md", info_text + "\n")
+    notes_source = JOBS / str(job.get("id")) / "markdown" / "notes.md"
+    try:
+        if notes_source.is_file():
+            _write_if_changed(directory / "notes.md", notes_source.read_text(encoding="utf-8", errors="replace"))
+        else:
+            (directory / "notes.md").unlink(missing_ok=True)
+    except OSError:
+        pass
     signature_path.write_text(json.dumps(signature, ensure_ascii=False), encoding="utf-8")
     return directory
 
@@ -335,6 +343,7 @@ def _system_prompt(job: dict[str, Any] | None) -> str:
         "- `paper.md`：论文原文全文，按“## 第 N 页”分页；这是主要依据。\n"
         "- `translation.md`：中文译文（机器翻译，仅供参照，可能有误）。\n"
         "- `info.md`：文献元数据。\n"
+        "- `notes.md`：用户自己记录的阅读备忘录（可能不完整；与原文冲突时以论文为准）。\n"
         f"- 其他论文的 Markdown 位于文献目录 `{JOBS}` 下；需要时可按标题检索。\n"
         "\n"
         "回答规则：\n"
