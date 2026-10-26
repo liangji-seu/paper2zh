@@ -3,9 +3,10 @@ import {ContinuousReader} from "/static/reader.mjs";
 import {clampMenuPosition,markdownDirectoryFromResult,markdownLocationUrl} from "/static/file-context-menu.mjs";
 import {importFilesSequential,normalizeImportResult,summarizeImportResults,validateImportFile} from "/static/import-batch.mjs";
 import {createAgentPanel} from "/static/agent-panel.mjs";
+import {selectionAfterClick,chunks,pendingTranslationIds} from "/static/library-selection.mjs";
 pdfjs.GlobalWorkerOptions.workerSrc = "/static/vendor/pdfjs/pdf.worker.mjs";
 const $=id=>document.getElementById(id);
-const state={jobs:[],job:null,file:null,files:[],importInFlight:false,page:1,zoom:100,view:"compare",timer:null,docs:{},annotations:{},cacheJobOrder:[],selection:null,selectedAnnotation:null,undo:null,readerPreserve:true,selectRequest:0,jobsRequest:0,deletedJobIds:new Set(),library:{folders:[],documents:{}},expanded:new Set(),folderEdit:null,movingJob:null,deletingJob:null,deleteInFlight:null,deletingFolder:null,folderDeleteInFlight:null,folderDeleteRequest:0,draggingJob:null,dragMoveInFlight:null,dragRenderPending:false,dropFolderId:undefined};
+const state={jobs:[],job:null,file:null,files:[],importInFlight:false,page:1,zoom:100,view:"compare",timer:null,docs:{},annotations:{},cacheJobOrder:[],selection:null,selectedAnnotation:null,undo:null,readerPreserve:true,selectRequest:0,jobsRequest:0,deletedJobIds:new Set(),library:{folders:[],documents:{}},expanded:new Set(),folderEdit:null,movingJob:null,movingJobs:null,deletingJob:null,deleteInFlight:null,deletingFolder:null,folderDeleteInFlight:null,folderDeleteRequest:0,draggingJob:null,draggingJobs:[],dragMoveInFlight:null,dragRenderPending:false,dropFolderId:undefined,selectedJobIds:new Set(),selectionAnchor:null,visibleJobIds:[],batch:null,batchFinished:new Set()};
 const key=(side,jobId=state.job?.id)=>String(jobId)+":"+side;
 const path=id=>encodeURIComponent(String(id));
 let reader;
@@ -48,19 +49,88 @@ async function loadLibrary(){try{state.library=await api("/api/library");for(con
 function folderOptions(select,selected=null,exclude=null){select.replaceChildren();const root=document.createElement("option");root.value="";root.textContent="根目录";select.append(root);const walk=(parent,depth)=>{for(const folder of state.library.folders.filter(f=>f.parent_id===parent)){if(folder.id===exclude)continue;const option=document.createElement("option");option.value=folder.id;option.textContent="　".repeat(depth)+folder.name;select.append(option);walk(folder.id,depth+1);}};walk(null,0);select.value=selected||"";}
 function folderModal(action,id=null,parent=null){state.folderEdit={action,id};const folder=state.library.folders.find(f=>f.id===id);$("folder-title").textContent=action==="create_folder"?"新建文件夹":action==="rename_folder"?"重命名文件夹":"移动文件夹";$("folder-name-wrap").hidden=action==="move_folder";$("folder-name").value=action==="create_folder"?"":folder?.name||"";$("folder-parent").parentElement.hidden=action==="rename_folder";folderOptions($("folder-parent"),parent??folder?.parent_id??null,action==="move_folder"?id:null);msg("folder-msg","");open("folder-modal");}
 async function submitFolder(){const edit=state.folderEdit;if(!edit)return;const name=$("folder-name").value.trim(),parent_id=$("folder-parent").value||null;if(edit.action!=="move_folder"&&!name){msg("folder-msg","请输入文件夹名称。","error");return;}const payload={action:edit.action};if(edit.action==="create_folder")Object.assign(payload,{name,parent_id});else if(edit.action==="rename_folder")Object.assign(payload,{id:edit.id,name});else Object.assign(payload,{id:edit.id,parent_id});try{state.library=await post("/api/library",payload);if(edit.action==="create_folder")for(const folder of state.library.folders)if(folder.name===name&&folder.parent_id===parent_id)state.expanded.add(folder.id);close("folder-modal");renderList();}catch(error){msg("folder-msg",error.message,"error");}}
-function moveDocument(job){state.movingJob=job;$("move-name").textContent=job.filename;folderOptions($("move-destination"),state.library.documents?.[job.id]||null);msg("move-msg","");open("move-modal");}
-async function submitMove(){if(!state.movingJob)return;try{state.library=await post("/api/library",{action:"move_document",job_id:state.movingJob.id,folder_id:$("move-destination").value||null});close("move-modal");renderList();}catch(error){msg("move-msg",error.message,"error");}}
+function moveDocument(job){moveDocuments([job]);}
+function moveDocuments(jobs){
+  const list=(jobs||[]).filter(job=>job?.id);
+  if(!list.length)return;
+  state.movingJobs=list;state.movingJob=list[0];
+  $("move-name").textContent=list.length===1?(list[0].filename||"未命名论文"):`已选择 ${list.length} 篇论文`;
+  folderOptions($("move-destination"),state.library.documents?.[list[0].id]??null);
+  msg("move-msg","");
+  open("move-modal");
+}
+async function submitMove(){
+  const jobs=state.movingJobs?.length?state.movingJobs:(state.movingJob?[state.movingJob]:[]);
+  if(!jobs.length)return;
+  const button=$("submit-move");button.disabled=true;
+  try{
+    if(jobs.length===1){
+      state.library=await post("/api/library",{action:"move_document",job_id:jobs[0].id,folder_id:$("move-destination").value||null});
+      close("move-modal");renderList();return;
+    }
+    let library=state.library,failed=0;
+    for(const job of jobs){
+      try{const result=await post("/api/library",{action:"move_document",job_id:job.id,folder_id:$("move-destination").value||null});library=result?.library||result||library;}
+      catch(_error){failed++;}
+    }
+    state.library=library;close("move-modal");renderList();
+    if(failed)showFileToast(`已移动 ${jobs.length-failed} 篇，${failed} 篇失败`,"error");
+  }catch(error){msg("move-msg",error.message,"error");}finally{button.disabled=false;}
+}
 function folderForId(id){return state.library.folders?.find(folder=>String(folder.id)===String(id))||null;}
 function deleteFolder(folder){if(!folder?.id||state.folderDeleteInFlight||$("folder-delete-modal").classList.contains("open"))return;state.deletingFolder={id:folder.id,name:folder.name||"未命名文件夹",parent_id:folder.parent_id??null};$("folder-delete-name").textContent=state.deletingFolder.name;msg("folder-delete-msg","");open("folder-delete-modal");}
 async function submitFolderDelete(){const folder=state.deletingFolder;if(!folder?.id||state.folderDeleteInFlight)return;const button=$("submit-folder-delete"),request=++state.folderDeleteRequest;state.folderDeleteInFlight=String(folder.id);button.disabled=true;msg("folder-delete-msg","正在删除分类…");try{const result=await post("/api/library",{action:"delete_folder",id:folder.id});if(request!==state.folderDeleteRequest||state.deletingFolder?.id!==folder.id)return;state.library=result?.library||result;const activeIds=new Set((state.library.folders||[]).map(item=>String(item.id)));for(const id of [...state.expanded])if(!activeIds.has(String(id)))state.expanded.delete(id);const parent=folder.parent_id??null;if(parent!==null)state.expanded.add(parent);state.deletingFolder=null;state.folderDeleteInFlight=null;close("folder-delete-modal");renderList();}catch(error){if(request===state.folderDeleteRequest)msg("folder-delete-msg",error.message||"删除分类失败","error");}finally{if(request===state.folderDeleteRequest){state.folderDeleteInFlight=null;button.disabled=false;}}}
-function knownDraggedJob(){const id=state.draggingJob?.id;if(id==null||isDeletedJob(id))return null;return state.jobs.find(job=>String(job.id)===String(id))||null;}
+function knownDraggedJobs(){
+  const ids=(state.draggingJobs||[]).map(item=>String(item.id));
+  if(!ids.length&&state.draggingJob?.id!=null)ids.push(String(state.draggingJob.id));
+  return ids.map(id=>state.jobs.find(job=>String(job.id)===id)).filter(job=>job&&!isDeletedJob(job.id));
+}
+function knownDraggedJob(){return knownDraggedJobs()[0]||null;}
 function clearDropTarget(){document.querySelectorAll(".drop-target").forEach(node=>node.classList.remove("drop-target"));state.dropFolderId=undefined;}
-function clearDocumentDrag({render=true}={}){state.draggingJob=null;clearDropTarget();document.querySelectorAll(".dragging").forEach(node=>node.classList.remove("dragging"));if(render&&state.dragRenderPending){state.dragRenderPending=false;renderList();}}
-function startDocumentDrag(event,job){if(!job?.id||state.dragMoveInFlight||!state.jobs.some(item=>String(item.id)===String(job.id))||isDeletedJob(job.id))return;state.draggingJob={id:job.id};state.dragRenderPending=false;event.dataTransfer?.setData?.("application/x-paper2zh-job",String(job.id));event.dataTransfer?.setData?.("text/plain",String(job.id));if(event.dataTransfer)event.dataTransfer.effectAllowed="move";event.currentTarget?.classList?.add("dragging");}
-function canHandleDocumentDrop(event){const job=knownDraggedJob();if(!job)return false;const types=event?.dataTransfer?.types;if(types?.length&&!Array.from(types).includes("application/x-paper2zh-job"))return false;return true;}
+function clearDocumentDrag({render=true}={}){state.draggingJob=null;state.draggingJobs=[];clearDropTarget();document.querySelectorAll(".dragging").forEach(node=>node.classList.remove("dragging"));if(render&&state.dragRenderPending){state.dragRenderPending=false;renderList();}}
+function startDocumentDrag(event,job){
+  if(!job?.id||state.dragMoveInFlight||!state.jobs.some(item=>String(item.id)===String(job.id))||isDeletedJob(job.id))return;
+  const selected=state.selectedJobIds&&typeof state.selectedJobIds.size==="number"?[...state.selectedJobIds].map(String):[];
+  const ids=selected.includes(String(job.id))?selected:[String(job.id)];
+  const jobs=ids.map(id=>state.jobs.find(item=>String(item.id)===id)).filter(item=>item&&!isDeletedJob(item.id));
+  if(!jobs.length)return;
+  const payload=jobs.map(item=>String(item.id));
+  state.draggingJobs=jobs.map(item=>({id:item.id}));
+  state.draggingJob={id:jobs[0].id};
+  state.dragRenderPending=false;
+  event.dataTransfer?.setData?.("application/x-paper2zh-jobs",JSON.stringify(payload));
+  event.dataTransfer?.setData?.("application/x-paper2zh-job",String(job.id));
+  event.dataTransfer?.setData?.("text/plain",payload.join("\n"));
+  if(event.dataTransfer)event.dataTransfer.effectAllowed="move";
+  event.currentTarget?.classList?.add("dragging");
+  document.querySelectorAll?.("[data-job-id]")?.forEach?.(node=>{if(payload.includes(String(node.dataset?.jobId)))node.classList.add("dragging");});
+}
+function canHandleDocumentDrop(event){if(!knownDraggedJobs().length)return false;const types=event?.dataTransfer?.types;if(types?.length&&!Array.from(types).some(type=>type==="application/x-paper2zh-job"||type==="application/x-paper2zh-jobs"))return false;return true;}
 function documentDragOver(event,folderId,target){if(!canHandleDocumentDrop(event))return;event.preventDefault();event.stopPropagation();if(event.dataTransfer)event.dataTransfer.dropEffect="move";if(state.dropFolderId!==folderId){clearDropTarget();state.dropFolderId=folderId;target.classList.add("drop-target");}else target.classList.add("drop-target");}
 function documentDragLeave(event,target){if(!target.contains(event.relatedTarget)){target.classList.remove("drop-target");if(String(state.dropFolderId??"")===String(target.dataset.folderId??""))state.dropFolderId=undefined;}}
-async function moveDocumentByDrag(folderId,target){const job=knownDraggedJob();if(!job||state.dragMoveInFlight)return;const currentFolder=state.library.documents?.[job.id]??null;const sameFolder=currentFolder===null&&folderId===null||currentFolder!==null&&folderId!==null&&String(currentFolder)===String(folderId);if(sameFolder){clearDocumentDrag();return;}state.dragMoveInFlight=String(job.id);clearDropTarget();try{const result=await post("/api/library",{action:"move_document",job_id:job.id,folder_id:folderId??null});state.library=result?.library||result;if(folderId!==null)state.expanded.add(folderId);const pending=state.dragRenderPending;clearDocumentDrag();if(!pending)renderList();}catch(error){clearDocumentDrag();showFileToast(error.message||"移动论文失败","error");}finally{state.dragMoveInFlight=null;}}
+async function moveDocumentByDrag(folderId,target){
+  const jobs=knownDraggedJobs();
+  if(!jobs.length||state.dragMoveInFlight)return;
+  const moving=jobs.filter(job=>{const current=state.library.documents?.[job.id]??null;const same=current===null&&folderId===null||current!==null&&folderId!==null&&String(current)===String(folderId);return !same;});
+  if(!moving.length){clearDocumentDrag();return;}
+  state.dragMoveInFlight=true;clearDropTarget();
+  let library=state.library,failed=0;
+  try{
+    for(const job of moving){
+      try{const result=await post("/api/library",{action:"move_document",job_id:job.id,folder_id:folderId??null});library=result?.library||result||library;}
+      catch(_error){failed++;}
+    }
+    state.library=library;
+    if(folderId!==null)state.expanded.add(folderId);
+    if(!failed&&state.selectedJobIds?.clear){state.selectedJobIds.clear();state.selectionAnchor=null;}
+    const pending=state.dragRenderPending;
+    clearDocumentDrag();
+    if(!pending)renderList();
+    if(failed)showFileToast(`已移动 ${moving.length-failed} 篇，${failed} 篇失败`,"error");
+    else if(moving.length>1)showFileToast(`已移动 ${moving.length} 篇论文`);
+  }catch(error){clearDocumentDrag();showFileToast(error.message||"移动论文失败","error");}
+  finally{state.dragMoveInFlight=null;if(typeof updateActions==="function")updateActions();}
+}
 function documentDrop(event,folderId,target){if(!canHandleDocumentDrop(event))return;event.preventDefault();event.stopPropagation();target.classList.remove("drop-target");moveDocumentByDrag(folderId,target);}
 function bindDocumentDropTarget(target,folderId){target.dataset.folderId=folderId===null?"":String(folderId);target.addEventListener("dragover",event=>documentDragOver(event,folderId,target));target.addEventListener("dragenter",event=>documentDragOver(event,folderId,target));target.addEventListener("dragleave",event=>documentDragLeave(event,target));target.addEventListener("drop",event=>documentDrop(event,folderId,target));}
 const uiIcons={
@@ -78,7 +148,7 @@ const uiIcons={
   trash:'<svg viewBox="0 0 16 16" focusable="false"><path d="M3.5 4.5h9M6 4.5V3h4v1.5M5 6.25v6.5h6v-6.5M7 7.75v3.5M9 7.75v3.5"/></svg>',
 };
 function iconSvg(name){const icon=document.createElement("span");icon.className="ui-icon";icon.setAttribute("aria-hidden","true");icon.innerHTML=uiIcons[name]||"";return icon;}
-function openFileMenu(event,job,trigger=event.currentTarget){event?.preventDefault?.();event?.stopPropagation?.();const menu=$("file-context-menu");fileMenuJob=job;fileMenuTrigger=trigger;trigger?.setAttribute?.("aria-haspopup","menu");trigger?.setAttribute?.("aria-expanded","true");menu.hidden=false;menu.classList.add("open");const rect=trigger?.getBoundingClientRect?.()||{left:event?.clientX||8,top:event?.clientY||8,right:event?.clientX||8,bottom:event?.clientY||8};const menuRect=menu.getBoundingClientRect();const point=clampMenuPosition({x:event?.clientX??rect.left,y:event?.clientY??rect.bottom,width:menuRect.width,height:menuRect.height,viewportWidth:window.innerWidth,viewportHeight:window.innerHeight});menu.style.left=point.left+"px";menu.style.top=point.top+"px";menu.querySelector("[role=menuitem]")?.focus();}
+function openFileMenu(event,job,trigger=event.currentTarget){event?.preventDefault?.();event?.stopPropagation?.();const menu=$("file-context-menu");fileMenuJob=job;fileMenuTrigger=trigger;trigger?.setAttribute?.("aria-haspopup","menu");trigger?.setAttribute?.("aria-expanded","true");menu.hidden=false;menu.classList.add("open");const multi=state.selectedJobIds instanceof Set&&state.selectedJobIds.size>1&&state.selectedJobIds.has(String(job.id));const moveItem=menu.querySelector('[data-file-action="move"]');const moveLabel=moveItem?.lastChild;if(moveLabel&&moveLabel.nodeType===3)moveLabel.textContent=multi?` 移动所选 ${state.selectedJobIds.size} 篇到文件夹`:" 移动到文件夹";menu.querySelector('[data-file-action="copy-markdown"]').hidden=multi;menu.querySelector('[data-file-action="delete"]').hidden=multi;const rect=trigger?.getBoundingClientRect?.()||{left:event?.clientX||8,top:event?.clientY||8,right:event?.clientX||8,bottom:event?.clientY||8};const menuRect=menu.getBoundingClientRect();const point=clampMenuPosition({x:event?.clientX??rect.left,y:event?.clientY??rect.bottom,width:menuRect.width,height:menuRect.height,viewportWidth:window.innerWidth,viewportHeight:window.innerHeight});menu.style.left=point.left+"px";menu.style.top=point.top+"px";menu.querySelector("[role=menuitem]")?.focus();}
 function closeFileMenu(restoreFocus=true){const menu=$("file-context-menu");menu.classList.remove("open");menu.hidden=true;const trigger=fileMenuTrigger;trigger?.setAttribute?.("aria-expanded","false");fileMenuJob=null;fileMenuTrigger=null;if(restoreFocus)trigger?.focus?.();}
 function showFileToast(text,kind=""){const toast=$("file-toast");if(fileToastTimer)clearTimeout(fileToastTimer);toast.textContent=text;toast.className="file-toast"+(kind?" "+kind:"");toast.hidden=false;fileToastTimer=setTimeout(()=>{toast.hidden=true;fileToastTimer=0;},2600);}
 async function copyText(text){if(navigator.clipboard?.writeText){try{await navigator.clipboard.writeText(text);return;}catch(_error){}}
@@ -87,14 +157,14 @@ async function copyMarkdownDirectory(job){if(!job?.id)throw Error("未找到要�
   const result=await api(markdownLocationUrl(job.id));const directory=markdownDirectoryFromResult(result);await copyText(directory);return directory;}
 function isDeletedJob(jobId){return state.deletedJobIds.has(String(jobId));}
 function deleteDocument(job){if(!job?.id||isDeletedJob(job.id)||state.deleteInFlight||$("delete-modal").classList.contains("open"))return;state.deletingJob={id:job.id,title:jobTitle(job)||job.filename||"未命名论文"};$("delete-name").textContent=state.deletingJob.title;msg("delete-msg","");open("delete-modal");}
-function clearDeletedJob(jobId){const id=String(jobId),oldJobs=state.jobs.slice(),deletedIndex=oldJobs.findIndex(job=>String(job.id)===id),deletingCurrent=state.job?.id!=null&&String(state.job.id)===id;state.deletedJobIds.add(id);state.jobsRequest++;state.selectRequest++;if(deletingCurrent&&state.timer){clearTimeout(state.timer);state.timer=null;}state.jobs=oldJobs.filter(job=>String(job.id)!==id);for(const cacheKey of Object.keys(state.docs)){if(cacheKey.startsWith(id+":"))disposeDocument(cacheKey);}for(const cacheKey of Object.keys(state.annotations)){if(cacheKey.startsWith(id+":"))delete state.annotations[cacheKey];}state.cacheJobOrder=state.cacheJobOrder.filter(cacheId=>String(cacheId)!==id);const deletedSelection=state.selection?.jobId!=null&&String(state.selection.jobId)===id;if(deletedSelection){state.selection=null;$("annotation-menu").classList.remove("open");}if(state.selectedAnnotation?.jobId!=null&&String(state.selectedAnnotation.jobId)===id)state.selectedAnnotation=null;if(state.undo?.jobId!=null&&String(state.undo.jobId)===id)state.undo=null;if(deletingCurrent){reader?.destroy();state.job=null;state.page=1;state.zoom=100;$("empty").hidden=false;$("pages").hidden=true;$("pagebar").hidden=true;$("title").textContent="选择一篇论文";$("notice").textContent="";$("notice").classList.remove("show");$("progress-wrap").hidden=true;$("progress-stage").textContent="正在准备";$("progress-value").textContent="处理中";$("progress-fill").style.width="";$("token-usage").textContent="Token 未统计";$("status-text").textContent="就绪";$("page-number").value=1;$("total").textContent="—";$("zoom-label").textContent="100%";$("open-translate").disabled=true;$("open-download").disabled=true;agentPanel.setPaper(null);const next=state.jobs[deletedIndex]||state.jobs[deletedIndex-1];return next?.id??null;}renderList();return null;}
+function clearDeletedJob(jobId){const id=String(jobId),oldJobs=state.jobs.slice(),deletedIndex=oldJobs.findIndex(job=>String(job.id)===id),deletingCurrent=state.job?.id!=null&&String(state.job.id)===id;state.deletedJobIds.add(id);state.selectedJobIds?.delete?.(id);state.jobsRequest++;state.selectRequest++;if(deletingCurrent&&state.timer){clearTimeout(state.timer);state.timer=null;}state.jobs=oldJobs.filter(job=>String(job.id)!==id);for(const cacheKey of Object.keys(state.docs)){if(cacheKey.startsWith(id+":"))disposeDocument(cacheKey);}for(const cacheKey of Object.keys(state.annotations)){if(cacheKey.startsWith(id+":"))delete state.annotations[cacheKey];}state.cacheJobOrder=state.cacheJobOrder.filter(cacheId=>String(cacheId)!==id);const deletedSelection=state.selection?.jobId!=null&&String(state.selection.jobId)===id;if(deletedSelection){state.selection=null;$("annotation-menu").classList.remove("open");}if(state.selectedAnnotation?.jobId!=null&&String(state.selectedAnnotation.jobId)===id)state.selectedAnnotation=null;if(state.undo?.jobId!=null&&String(state.undo.jobId)===id)state.undo=null;if(deletingCurrent){reader?.destroy();state.job=null;state.page=1;state.zoom=100;$("empty").hidden=false;$("pages").hidden=true;$("pagebar").hidden=true;$("title").textContent="选择一篇论文";$("notice").textContent="";$("notice").classList.remove("show");$("progress-wrap").hidden=true;$("progress-stage").textContent="正在准备";$("progress-value").textContent="处理中";$("progress-fill").style.width="";$("token-usage").textContent="Token 未统计";$("status-text").textContent="就绪";$("page-number").value=1;$("total").textContent="—";$("zoom-label").textContent="100%";$("open-translate").disabled=true;$("open-download").disabled=true;agentPanel.setPaper(null);const next=state.jobs[deletedIndex]||state.jobs[deletedIndex-1];return next?.id??null;}renderList();return null;}
 async function submitDelete(){const job=state.deletingJob;if(!job?.id||isDeletedJob(job.id)||state.deleteInFlight)return;const button=$("submit-delete");state.deleteInFlight=String(job.id);button.disabled=true;msg("delete-msg","正在移除文献库副本…");try{const result=await post("/api/jobs/"+path(job.id)+"/delete",{});const nextId=clearDeletedJob(job.id);state.deletingJob=null;state.deleteInFlight=null;close("delete-modal");state.library=result.library||await api("/api/library");await loadJobs(false);if(!state.job&&state.jobs.length)await select(nextId&&state.jobs.some(item=>String(item.id)===String(nextId))?nextId:state.jobs[0].id);renderList();msg("status","已从文献库移除，软件托管文件和记录已清理，外部原始 PDF 未删除。");}catch(error){msg("delete-msg",error.message||"删除失败","error");}finally{state.deleteInFlight=null;button.disabled=false;}}
-async function runFileMenuAction(action){const job=fileMenuJob;closeFileMenu();if(!job)return;if(action==="move"){moveDocument(job);return;}if(action==="delete"){deleteDocument(job);return;}if(action!=="copy-markdown")return;try{await copyMarkdownDirectory(job);showFileToast("Markdown 目录地址已复制");}catch(error){showFileToast(error.message||"目录地址复制失败","error");}}
+async function runFileMenuAction(action){const job=fileMenuJob;closeFileMenu();if(!job)return;if(action==="move"){const ids=state.selectedJobIds instanceof Set&&state.selectedJobIds.size>1&&state.selectedJobIds.has(String(job.id))?[...state.selectedJobIds]:[job.id];const jobs=ids.map(id=>state.jobs.find(item=>String(item.id)===String(id))).filter(Boolean);moveDocuments(jobs);return;}if(action==="delete"){deleteDocument(job);return;}if(action!=="copy-markdown")return;try{await copyMarkdownDirectory(job);showFileToast("Markdown 目录地址已复制");}catch(error){showFileToast(error.message||"目录地址复制失败","error");}}
 function renderList(){
   if(state.draggingJob){state.dragRenderPending=true;return;}
   if(fileMenuJob)closeFileMenu(false);
   const box=$("files");box.replaceChildren();
-  const folders=state.library.folders||[],mapping=state.library.documents||{},jobs=state.jobs.filter(job=>!isDeletedJob(job.id));
+  const folders=state.library.folders||[],mapping=state.library.documents||{},jobs=state.jobs.filter(job=>!isDeletedJob(job.id)),visible=[];
   const rootTarget=document.createElement("div");
   rootTarget.className="library-root-drop";
   rootTarget.setAttribute("role","button");
@@ -108,6 +178,8 @@ function renderList(){
   const addJob=(job,depth)=>{
     const row=document.createElement("div");
     row.className="file-row";
+    row.dataset.jobId=String(job.id);
+    visible.push(String(job.id));
     row.style.paddingLeft=(6+depth*14)+"px";
     row.draggable=true;
     const button=document.createElement("button");
@@ -126,7 +198,19 @@ function renderList(){
     }
     button.title=(job.filename||"")+" · "+label(job)+" · "+(job.page_count||"?")+" 页";
     if(state.job?.id===job.id)row.classList.add("active");
-    button.addEventListener("click",()=>{closeFileMenu(false);select(job.id);});
+    if(state.selectedJobIds.has(String(job.id))&&state.job?.id!==job.id)row.classList.add("selected");
+    button.addEventListener("click",event=>{
+      closeFileMenu(false);
+      if(event.ctrlKey||event.metaKey||event.shiftKey){
+        const result=selectionAfterClick(state.selectedJobIds,state.visibleJobIds,state.selectionAnchor,job.id,{ctrl:event.ctrlKey||event.metaKey,meta:false,shift:event.shiftKey});
+        state.selectedJobIds=new Set(result.selected);
+        state.selectionAnchor=result.anchor;
+        renderList();updateActions();
+        return;
+      }
+      state.selectedJobIds.clear();state.selectionAnchor=job.id;
+      select(job.id);
+    });
     button.addEventListener("contextmenu",event=>openFileMenu(event,job,button));
     button.addEventListener("keydown",event=>{if((event.key==="ContextMenu")||(event.shiftKey&&event.key==="F10")){event.preventDefault();openFileMenu(event,job,button);}});
     const menuButton=document.createElement("button");
@@ -177,12 +261,126 @@ function renderList(){
   walk(null,0);
   for(const job of jobs.filter(j=>!mapping[j.id]))addJob(job,0);
   if(!folders.length&&!jobs.length){const empty=document.createElement("div");empty.className="files-empty";empty.textContent="还没有论文。";box.append(empty);}
+  state.visibleJobIds=visible;
+  updateActions();
 }
 
-async function loadJobs(selectFirst=true){const request=++state.jobsRequest;try{const data=await api("/api/jobs");if(request!==state.jobsRequest)return;state.jobs=(data.jobs||[]).filter(job=>!isDeletedJob(job.id));renderList();if(selectFirst&&!state.job&&state.jobs.length)await select(state.jobs[0].id);}catch(error){if(request===state.jobsRequest)msg("status",error.message,"error");}}
-async function select(id){if(isDeletedJob(id))return;const request=++state.selectRequest;try{const job=await api("/api/jobs/"+path(id));if(request!==state.selectRequest||isDeletedJob(id)||isDeletedJob(job.id))return;const previousJobId=state.job?.id;if(previousJobId&&previousJobId!==job.id)reader?.destroy();state.job=job;agentPanel.setPaper(job);touchCacheJob(job.id);trimJobCaches();state.page=1;state.zoom=100;state.view="compare";state.readerPreserve=false;state.selection=null;state.selectedAnnotation=null;state.undo=null;$("sidebar").classList.remove("open");renderList();showJob();poll();}catch(error){if(request===state.selectRequest&&!isDeletedJob(id))msg("status",error.message,"error");}}
+function updateActions(){
+  const count=state.selectedJobIds?.size||0;
+  const multi=count>1;
+  const chip=$("selection-chip");
+  if(chip){chip.hidden=!multi;if(multi)$("selection-count").textContent=`已选 ${count} 篇`;}
+  const label=$("translate-label");
+  if(label)label.textContent=multi?`翻译所选 (${count})`:"翻译";
+  const busy=Boolean(state.batch?.active);
+  const translate=$("open-translate");
+  if(translate)translate.disabled=busy||(multi?false:(!state.job||["queued","running"].includes(state.job.status)));
+  const download=$("open-download");
+  if(download)download.disabled=multi||!state.job||!hasTranslation(state.job);
+}
+function clearSelection(){if(!state.selectedJobIds?.size)return;state.selectedJobIds.clear();state.selectionAnchor=null;renderList();updateActions();}
+function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
+function openBatchTranslate(ids){
+  const eligible=pendingTranslationIds(state.jobs,ids);
+  if(!eligible.length){showFileToast("所选论文都已翻译或正在翻译","error");return;}
+  const pages=eligible.reduce((sum,id)=>{const job=state.jobs.find(item=>String(item.id)===id);return sum+(Number(job?.page_count)||0);},0);
+  state.batchRequest={ids:eligible};
+  $("batch-translate-summary").textContent=`已选 ${ids.length} 篇，其中 ${eligible.length} 篇需要翻译，共约 ${pages} 页。`;
+  msg("batch-translate-msg","");
+  open("batch-translate-modal");
+}
+function submitBatchTranslate(){const ids=state.batchRequest?.ids||[];close("batch-translate-modal");if(ids.length)void runBatchTranslation(ids);}
+function updateBatchBar(){
+  const batch=state.batch,wrap=$("batch-progress-wrap");
+  if(!wrap)return;
+  if(!batch||!batch.active){wrap.hidden=true;return;}
+  wrap.hidden=false;
+  const total=batch.ids.length,finished=batch.finished.size,failed=batch.failed.size;
+  $("batch-progress-stage").textContent=`批量翻译 · ${finished}/${total} 完成`+(failed?` · ${failed} 失败`:"");
+  $("batch-progress-value").textContent=`${Math.round(finished/total*100)}%`;
+  $("batch-progress-fill").style.width=`${Math.max(0,Math.min(100,finished/total*100))}%`;
+}
+async function runBatchTranslation(ids){
+  const batch={ids:[...ids],finished:new Set(),failed:new Set(),active:true};
+  state.batch=batch;updateActions();updateBatchBar();
+  for(const group of chunks(batch.ids,3)){
+    const started=[];
+    for(const id of group){
+      try{await post("/api/jobs/"+path(id)+"/translate",{mode:"full",pages:"",demo_mode:false});started.push(String(id));}
+      catch(_error){
+        const job=state.jobs.find(item=>String(item.id)===String(id));
+        if(!job||job.status!=="completed")batch.failed.add(String(id));
+        batch.finished.add(String(id));
+      }
+    }
+    updateBatchBar();
+    while(true){
+      await sleep(2500);
+      try{await loadJobs(false);}catch(_error){}
+      for(const id of started){
+        const job=state.jobs.find(item=>String(item.id)===String(id));
+        if(!job){batch.failed.add(id);batch.finished.add(id);continue;}
+        if(job.status==="completed")batch.finished.add(id);
+        else if(job.status==="failed"){batch.failed.add(id);batch.finished.add(id);}
+      }
+      updateBatchBar();
+      const active=started.some(id=>{const job=state.jobs.find(item=>String(item.id)===String(id));return job&&["queued","running"].includes(job.status);});
+      if(!active)break;
+    }
+  }
+  batch.active=false;state.batch=null;
+  if(!batch.failed.size){state.selectedJobIds.clear();state.selectionAnchor=null;}
+  updateActions();
+  await loadJobs(false);
+  if(state.job){try{state.job=await api("/api/jobs/"+path(state.job.id));showJob();}catch(_error){}}
+  const success=batch.ids.length-batch.failed.size;
+  if(batch.failed.size)msg("status",`批量翻译完成：${success} 篇成功，${batch.failed.size} 篇失败。`,"error");
+  else msg("status",`批量翻译完成：${success} 篇全部成功。`,"ok");
+  $("batch-progress-stage").textContent=`批量翻译完成：${success} 成功${batch.failed.size?`，${batch.failed.size} 失败`:""}`;
+  $("batch-progress-value").textContent="100%";
+  $("batch-progress-fill").style.width="100%";
+  setTimeout(()=>{if(!state.batch)$("batch-progress-wrap").hidden=true;},6000);
+}
+async function nativeFolderImport(){
+  if(state.importInFlight)return;
+  setImportBusy(true);msg("import-msg","请在系统窗口中选择包含 PDF 的文件夹…");
+  try{
+    const result=await window.pywebview.api.import_folder({action:"import"});
+    if(result?.cancelled){msg("import-msg","");return;}
+    if(result?.error)throw Error(result.error);
+    if(!result?.total){msg("import-msg","该文件夹中没有 PDF 文件。","error");return;}
+    const results=(result.results||[]).map(item=>item?.error?{filename:item.filename||"未命名论文",error:item.error}:normalizeImportResult(item,item?.filename));
+    await finishBatchImport(results);
+    if(result.truncated)msg("import-msg",`文件较多，仅导入前 ${result.total} 个 PDF。`,"error");
+  }catch(error){msg("import-msg",error.message||"文件夹导入失败","error");}
+  finally{setImportBusy(false);}
+}
+function pickFolder(){if(state.importInFlight)return;if(window.pywebview?.api?.import_folder)return nativeFolderImport();$("folder-input").click();}
+function chooseFolderFiles(files){
+  const pdfs=Array.from(files||[]).filter(file=>/\.pdf$/i.test(String(file.name||"")));
+  if(!pdfs.length){msg("import-msg","该文件夹中没有 PDF 文件。","error");return;}
+  $("import-action").value="import";
+  chooseFiles(pdfs);
+  void submitImport({files:pdfs,action:"import"});
+}
+function initFileDrop(){
+  let depth=0;
+  const hasFiles=event=>Array.from(event.dataTransfer?.types||[]).includes("Files");
+  document.addEventListener("dragenter",event=>{if(!hasFiles(event)||state.draggingJob)return;event.preventDefault();depth++;document.body.classList.add("file-drop-active");});
+  document.addEventListener("dragover",event=>{if(!hasFiles(event)||state.draggingJob)return;event.preventDefault();if(event.dataTransfer)event.dataTransfer.dropEffect="copy";document.body.classList.add("file-drop-active");});
+  document.addEventListener("dragleave",event=>{if(!hasFiles(event))return;depth=Math.max(0,depth-1);if(!depth)document.body.classList.remove("file-drop-active");});
+  document.addEventListener("drop",event=>{
+    if(!hasFiles(event)||state.draggingJob)return;
+    event.preventDefault();depth=0;document.body.classList.remove("file-drop-active");
+    const files=Array.from(event.dataTransfer?.files||[]).filter(file=>/\.pdf$/i.test(String(file.name||"")));
+    if(!files.length){showFileToast("请拖入 PDF 文件","error");return;}
+    openImportModal();$("import-action").value="import";chooseFiles(files);void submitImport({files,action:"import"});
+  });
+}
+async function loadJobs(selectFirst=true){const request=++state.jobsRequest;try{const data=await api("/api/jobs");if(request!==state.jobsRequest)return;state.jobs=(data.jobs||[]).filter(job=>!isDeletedJob(job.id));const existing=new Set(state.jobs.map(job=>String(job.id)));for(const id of [...state.selectedJobIds])if(!existing.has(String(id)))state.selectedJobIds.delete(id);renderList();if(selectFirst&&!state.job&&state.jobs.length)await select(state.jobs[0].id);}catch(error){if(request===state.jobsRequest)msg("status",error.message,"error");}}
+async function select(id){if(isDeletedJob(id))return;const request=++state.selectRequest;try{const job=await api("/api/jobs/"+path(id));if(request!==state.selectRequest||isDeletedJob(id)||isDeletedJob(job.id))return;const previousJobId=state.job?.id;if(previousJobId&&previousJobId!==job.id)reader?.destroy();state.job=job;agentPanel.setPaper(job);state.selectedJobIds.clear();state.selectionAnchor=job.id;touchCacheJob(job.id);trimJobCaches();state.page=1;state.zoom=100;state.view="compare";state.readerPreserve=false;state.selection=null;state.selectedAnnotation=null;state.undo=null;$("sidebar").classList.remove("open");renderList();showJob();poll();}catch(error){if(request===state.selectRequest&&!isDeletedJob(id))msg("status",error.message,"error");}}
 function updateProgress(job){const active=job.status==="queued"||job.status==="running",wrap=$("progress-wrap"),value=$("progress-value"),fill=$("progress-fill");$("open-download").disabled=active||!hasTranslation(job);wrap.hidden=!active;if(!active)return;const number=Number(job.progress),known=Number.isFinite(number)&&job.progress!==null&&!job.progress_indeterminate;wrap.classList.toggle("indeterminate",!known);fill.style.width=known?Math.max(0,Math.min(100,number))+"%":"";$("progress-stage").textContent=job.message||({queued:"等待处理",running:"正在翻译"}[job.status]||"处理中");value.textContent=known?Math.round(number)+"%":"处理中";}
-function showJob(){const job=state.job;if(!job)return;$("title").textContent=job.translated_title||job.display_title||job.filename||"未命名论文";$("title").title=job.filename||"";const usage=job.token_usage;$("token-usage").textContent=usage?"Token 累计 "+Number(usage.total_tokens).toLocaleString()+" · 本次 "+Number(usage.last_run?.total_tokens||0).toLocaleString():"Token 未统计";$("total").textContent=job.page_count||"—";$("page-number").value=state.page;$("zoom-label").textContent=state.zoom+"%";$("open-translate").disabled=job.status==="queued"||job.status==="running";$("open-download").disabled=!hasTranslation(job);$("empty").hidden=true;$("pages").hidden=false;$("pagebar").hidden=false;document.querySelectorAll("[data-view]").forEach(b=>b.classList.toggle("active",b.dataset.view===state.view));let note="";if(job.demo_mode&&hasTranslation(job))note="演示模式：译文是原文副本，未调用 API。";else if(job.status==="failed")note=job.error||"翻译失败，仍可阅读原文。";else if(!hasTranslation(job)&&job.status!=="queued"&&job.status!=="running")note="尚无译文。点击右上角“翻译”开始。";$("notice").textContent=note;$("notice").classList.toggle("show",Boolean(note));msg("status",job.status==="failed"?(job.error||"失败"):label(job),job.status==="failed"?"error":"");updateProgress(job);renderPage();}
+function showJob(){const job=state.job;if(!job)return;$("title").textContent=job.translated_title||job.display_title||job.filename||"未命名论文";$("title").title=job.filename||"";const usage=job.token_usage;$("token-usage").textContent=usage?"Token 累计 "+Number(usage.total_tokens).toLocaleString()+" · 本次 "+Number(usage.last_run?.total_tokens||0).toLocaleString():"Token 未统计";$("total").textContent=job.page_count||"—";$("page-number").value=state.page;$("zoom-label").textContent=state.zoom+"%";$("open-translate").disabled=job.status==="queued"||job.status==="running";$("open-download").disabled=!hasTranslation(job);$("empty").hidden=true;$("pages").hidden=false;$("pagebar").hidden=false;document.querySelectorAll("[data-view]").forEach(b=>b.classList.toggle("active",b.dataset.view===state.view));let note="";if(job.demo_mode&&hasTranslation(job))note="演示模式：译文是原文副本，未调用 API。";else if(job.status==="failed")note=job.error||"翻译失败，仍可阅读原文。";else if(!hasTranslation(job)&&job.status!=="queued"&&job.status!=="running")note="尚无译文。点击右上角“翻译”开始。";$("notice").textContent=note;$("notice").classList.toggle("show",Boolean(note));msg("status",job.status==="failed"?(job.error||"失败"):label(job),job.status==="failed"?"error":"");updateProgress(job);renderPage();updateActions();}
 function touchCacheJob(jobId){state.cacheJobOrder=state.cacheJobOrder.filter(id=>id!==jobId);state.cacheJobOrder.unshift(jobId);}
 function disposeDocument(cacheKey){const promise=state.docs[cacheKey];if(!promise)return;delete state.docs[cacheKey];Promise.resolve(promise).then(doc=>doc?.destroy?.()).catch(()=>{});}
 function trimJobCaches(){const keep=new Set(state.cacheJobOrder.slice(0,3));if(state.job?.id)keep.add(state.job.id);for(const cacheKey of Object.keys(state.docs)){const jobId=cacheKey.slice(0,cacheKey.lastIndexOf(":"));if(!keep.has(jobId)&&jobId!==state.job?.id)disposeDocument(cacheKey);}for(const cacheKey of Object.keys(state.annotations)){const jobId=cacheKey.slice(0,cacheKey.lastIndexOf(":"));if(!keep.has(jobId)&&jobId!==state.job?.id)delete state.annotations[cacheKey];}state.cacheJobOrder=state.cacheJobOrder.filter(id=>keep.has(id));}
@@ -196,10 +394,10 @@ function zoom(delta){state.zoom=Math.max(50,Math.min(200,state.zoom+delta));$("z
 function poll(){if(state.timer)clearTimeout(state.timer);const job=state.job;if(!job||isDeletedJob(job.id)||!["queued","running"].includes(job.status))return;state.timer=setTimeout(async()=>{try{const next=await api("/api/jobs/"+path(job.id));if(isDeletedJob(job.id)||state.job?.id!==job.id)return;const previous=state.job;const statusChanged=previous.status!==next.status;const translationChanged=hasTranslation(previous)!==hasTranslation(next);const titleChanged=jobTitle(previous)!==jobTitle(next);state.job=next;updateProgress(next);if(translationChanged||statusChanged&&next.status==="completed"){disposeDocument(key("translated",job.id));delete state.annotations[key("translated",job.id)];}const index=state.jobs.findIndex(j=>j.id===job.id);if(index>=0)state.jobs[index]={...state.jobs[index],...next};if(statusChanged||translationChanged||titleChanged)renderList();if(statusChanged||translationChanged||titleChanged)showJob();poll();}catch(error){if(!isDeletedJob(job.id)){msg("status",error.message,"error");state.timer=setTimeout(poll,3000);}}},1500);}
 function importOptions(){const action=$("import-action").value;$("import-options").hidden=action==="import";$("import-pages-wrap").hidden=$("import-mode").value==="full";$("submit-import").textContent=action==="import"?"导入":"导入并开始";const multiple=state.files.length>1;$("import-batch-hint").hidden=!multiple;if(multiple&&action!=="import")msg("import-msg","多篇导入仅支持“仅导入，稍后翻译”，请改回该选项后再提交。","error");}
 function translateOptions(){$("translate-pages-wrap").hidden=$("translate-mode").value==="full";}
-function clearImportSelection(){state.file=null;state.files=[];$("file-input").value="";$("pick-file").textContent="点击选择 PDF（最大 100 MB）";$("import-selection").textContent="未选择文件";$("import-batch-hint").hidden=true;$("import-summary").hidden=true;$("import-summary").replaceChildren();}
+function clearImportSelection(){state.file=null;state.files=[];$("file-input").value="";$("folder-input").value="";$("pick-file").textContent="点击选择 PDF（最大 100 MB）";$("import-selection").textContent="未选择文件";$("import-batch-hint").hidden=true;$("import-summary").hidden=true;$("import-summary").replaceChildren();}
 function openImportModal(){if(state.importInFlight)return;clearImportSelection();msg("import-msg","");open("import-modal");}
 function setImportProgress(done=null,total=null){const wrap=$("import-progress"),known=Number.isFinite(Number(done))&&Number(total)>0;wrap.classList.toggle("indeterminate",!known);$("import-progress-stage").textContent=known?"正在导入":"正在处理所选文件";$("import-progress-value").textContent=known?`${done}/${total}`:"处理中";$("import-progress-fill").style.width=known?Math.max(0,Math.min(100,Number(done)/Number(total)*100))+"%":"";}
-function setImportBusy(busy){state.importInFlight=Boolean(busy);for(const id of ["pick-file","file-input","import-action","import-mode","import-pages","submit-import"]){const el=$(id);if(el)el.disabled=state.importInFlight;}$("import-progress").hidden=!state.importInFlight;if(state.importInFlight)setImportProgress();else setImportProgress(null,null);if(!state.importInFlight)importOptions();}
+function setImportBusy(busy){state.importInFlight=Boolean(busy);for(const id of ["pick-file","pick-folder","file-input","folder-input","import-action","import-mode","import-pages","submit-import"]){const el=$(id);if(el)el.disabled=state.importInFlight;}$("import-progress").hidden=!state.importInFlight;if(state.importInFlight)setImportProgress();else setImportProgress(null,null);if(!state.importInFlight)importOptions();}
 function releaseImportFiles(){state.file=null;state.files=[];$("file-input").value="";$("pick-file").textContent="点击选择 PDF（最大 100 MB）";$("import-selection").textContent="批次已完成，可重新选择文件";$("import-batch-hint").hidden=true;}
 function chooseFiles(files){const selected=Array.from(files||[]);if(!selected.length)return;$("import-summary").hidden=true;$("import-summary").replaceChildren();const invalid=selected.map(file=>({file,error:validateImportFile(file)})).filter(item=>item.error);state.files=selected;state.file=selected.length===1?selected[0]:null;$("import-selection").textContent=`已选择 ${selected.length} 个文件`;$("pick-file").textContent=selected.length===1?selected[0].name:`已选择 ${selected.length} 个 PDF`;importOptions();if(invalid.length){const first=invalid[0];msg("import-msg",`已标记 ${invalid.length} 个失败项：${first.file?.name||"未命名论文"}：${first.error}`,"error");}else msg("import-msg","");}
 function choose(file){chooseFiles(file?[file]:[]);}
@@ -208,7 +406,45 @@ async function finishSingleImport(result){const normalized=normalizeImportResult
 async function openImportResult(result){return finishSingleImport(result);}
 async function finishBatchImport(results){const summary=renderBatchSummary(results);let refreshError=null;try{await loadJobs(false);const first=summary.added[0]||summary.duplicates[0];if(first?.job?.id!=null)await select(first.job.id);}catch(error){refreshError=error;}finally{releaseImportFiles();}if(refreshError)msg("status",refreshError.message||"列表刷新失败","error");else if(summary.failed.length)msg("status",`批量导入完成：${summary.added.length} 个新增，${summary.duplicates.length} 个重复，${summary.failed.length} 个失败。`,summary.added.length||summary.duplicates.length?"":"error");else msg("status",`批量导入完成：${summary.added.length} 个新增，${summary.duplicates.length} 个重复。`);msg("import-msg",refreshError?.message||"批次处理完成，请查看下方汇总。",refreshError?"error":"");return summary;}
 async function nativeImport(){const action=$("import-action").value,mode=$("import-mode").value,pages=$("import-pages").value.trim();if(action!=="import"&&mode==="trial"&&!pages){msg("import-msg","请填写页码范围。","error");return;}setImportBusy(true);msg("import-msg","请选择 PDF，确认后将逐篇导入，请稍候…");try{const result=await window.pywebview.api.import_pdf({action,mode,pages});if(result?.cancelled){msg("import-msg","");return;}if(result?.error)throw Error(result.error);if(Array.isArray(result?.results)){await finishBatchImport(result.results.map(item=>item?.error?{filename:item.filename||"未命名论文",error:item.error}:normalizeImportResult(item,item?.filename)));}else await finishSingleImport(result);}catch(error){msg("import-msg",error.message||"导入失败","error");}finally{setImportBusy(false);}}
-async function submitImport(){if(state.importInFlight)return;if(window.pywebview?.api?.import_pdf)return nativeImport();const files=state.files.length?state.files:(state.file?[state.file]:[]);if(!files.length){msg("import-msg","请先选择 PDF。","error");return;}const action=$("import-action").value,mode=$("import-mode").value,pages=$("import-pages").value.trim();if(files.length>1&&action!=="import"){msg("import-msg","多篇导入仅支持“仅导入，稍后翻译”，请改回该选项后再提交。","error");return;}if(action!=="import"&&mode==="trial"&&!pages){msg("import-msg","请填写页码范围。","error");return;}setImportBusy(true);msg("import-msg",files.length>1?`正在导入 ${files.length} 个文件…`:"正在导入…");try{if(files.length===1){const file=files[0],error=validateImportFile(file);if(error)throw Error(error);const form=new FormData();form.append("file",file);form.append("mode",action==="import"?"import":mode);form.append("pages",action==="import"?"":mode==="trial"?pages:"");form.append("demo_mode",action==="demo"?"true":"false");await finishSingleImport(await api("/api/jobs",{method:"POST",body:form}));}else{const results=await importFilesSequential(files,async file=>{const error=validateImportFile(file);if(error)throw Error(error);const form=new FormData();form.append("file",file);form.append("mode","import");form.append("pages","");form.append("demo_mode","false");return api("/api/jobs",{method:"POST",body:form});},(done,total)=>{setImportProgress(done,total);msg("import-msg",`正在导入 ${done}/${total} 个文件…`);});await finishBatchImport(results);}}catch(error){msg("import-msg",error.message||"导入失败","error");}finally{setImportBusy(false);}}
+async function submitImport(options={}){
+  if(state.importInFlight)return;
+  const forced=options&&Array.isArray(options.files)?options.files:null;
+  const forcedAction=options&&typeof options.action==="string"?options.action:null;
+  if(!forced&&window.pywebview?.api?.import_pdf)return nativeImport();
+  const files=forced&&forced.length?forced:(state.files.length?state.files:(state.file?[state.file]:[]));
+  if(!files.length){msg("import-msg","请先选择 PDF。","error");return;}
+  const action=forcedAction||$("import-action").value,mode=$("import-mode").value,pages=$("import-pages").value.trim();
+  if(files.length>1&&action!=="import"){msg("import-msg","多篇导入仅支持“仅导入，稍后翻译”，请改回该选项后再提交。","error");return;}
+  if(action!=="import"&&mode==="trial"&&!pages){msg("import-msg","请填写页码范围。","error");return;}
+  setImportBusy(true);
+  msg("import-msg",files.length>1?`正在导入 ${files.length} 个文件…`:"正在导入…");
+  try{
+    if(files.length===1&&!forced){
+      const file=files[0],error=validateImportFile(file);
+      if(error)throw Error(error);
+      const form=new FormData();
+      form.append("file",file);
+      form.append("mode",action==="import"?"import":mode);
+      form.append("pages",action==="import"?"":mode==="trial"?pages:"");
+      form.append("demo_mode",action==="demo"?"true":"false");
+      await finishSingleImport(await api("/api/jobs",{method:"POST",body:form}));
+    }else{
+      const results=await importFilesSequential(files,async file=>{
+        const error=validateImportFile(file);
+        if(error)throw Error(error);
+        const form=new FormData();
+        form.append("file",file);
+        form.append("mode","import");
+        form.append("pages","");
+        form.append("demo_mode","false");
+        return api("/api/jobs",{method:"POST",body:form});
+      },(done,total)=>{setImportProgress(done,total);msg("import-msg",`正在导入 ${done}/${total} 个文件…`);});
+      await finishBatchImport(results);
+    }
+  }catch(error){msg("import-msg",error.message||"导入失败","error");}
+  finally{setImportBusy(false);}
+}
+
 async function submitTranslate(){const job=state.job;if(!job)return;const mode=$("translate-mode").value,pages=$("translate-pages").value.trim();if(mode==="trial"&&!pages){msg("translate-msg","请填写页码范围。","error");return;}$("submit-translate").disabled=true;msg("translate-msg","正在启动…");try{const result=await post("/api/jobs/"+path(job.id)+"/translate",{mode,pages:mode==="trial"?pages:"",demo_mode:$("translate-demo").checked});close("translate-modal");state.job=result.job||await api("/api/jobs/"+path(job.id));disposeDocument(key("translated",job.id));delete state.annotations[key("translated",job.id)];await loadJobs();showJob();poll();}catch(error){msg("translate-msg",error.message,"error");}finally{$("submit-translate").disabled=false;}}
 async function loadSettings(){try{const data=await api("/api/settings");$("provider").value=data.provider||"";$("base-url").value=data.base_url||"";$("model").value=data.model||"";$("api-key").value="";$("reuse-key").checked=false;$("key-state").textContent=data.has_api_key?"已保存 "+(data.api_key_masked||"掩码 Key"):"当前未保存 Key";$("provider-summary").textContent=(data.provider||"服务")+" · "+(data.has_api_key?"已设置 Key":"未设置 Key");$("storage").textContent=data.storage||"";msg("settings-msg","");}catch(error){msg("settings-msg",error.message,"error");}}
 async function saveSettings(){const button=$("save-settings");button.disabled=true;try{const result=await post("/api/settings",{provider:$("provider").value.trim(),base_url:$("base-url").value.trim(),model:$("model").value.trim(),api_key:$("api-key").value,reuse_existing_key:$("reuse-key").checked});$("api-key").value="";$("reuse-key").checked=false;$("key-state").textContent=result.settings.has_api_key?"已保存 "+result.settings.api_key_masked:"当前未保存 Key";$("provider-summary").textContent=result.settings.provider+" · "+(result.settings.has_api_key?"已设置 Key":"未设置 Key");$("storage").textContent=result.settings.storage||"";msg("settings-msg","设置已保存。","ok");}catch(error){msg("settings-msg",error.message,"error");}finally{button.disabled=false;}}
@@ -245,9 +481,9 @@ function movePan(event){if(!panState.dragging||event.pointerId!==panState.pointe
 function endPan(){if(!panState.dragging){releasePanPointer();return;}panState.dragging=false;releasePanPointer();$("scroll").classList.remove("is-panning");window.getSelection()?.removeAllRanges();}
 async function addAnnotation(type,color){const selected=state.selection;if(!selected||!state.job||selected.jobId!==state.job.id)return;try{const current=await annotationsFor(selected.jobId,selected.side);if(state.job?.id!==selected.jobId)return;const result=await post("/api/jobs/"+path(selected.jobId)+"/"+selected.side+"/annotations",{action:"add",revision:current.revision,page:selected.page,type,color,rects:selected.rects});state.annotations[key(selected.side,selected.jobId)]=Promise.resolve(result);if(state.job?.id!==selected.jobId)return;const before=new Set((current.annotations||[]).map(x=>x.id));const added=(result.annotations||[]).find(x=>!before.has(x.id));if(added)state.undo={jobId:selected.jobId,side:selected.side,page:selected.page,id:added.id};state.selectedAnnotation=null;reader?.redrawAnnotations(selected.jobId,selected.side,selected.page,result.annotations||[]);$("annotation-menu").classList.remove("open");window.getSelection()?.removeAllRanges();state.selection=null;msg("status","批注已保存到本机。");}catch(error){if(state.job?.id===selected.jobId)msg("status",error.message,"error");}}
 async function deleteAnnotation(target){if(!target||!state.job||target.jobId!==state.job.id)return;try{const current=await annotationsFor(target.jobId,target.side);if(state.job?.id!==target.jobId)return;const result=await post("/api/jobs/"+path(target.jobId)+"/"+target.side+"/annotations",{action:"delete",revision:current.revision,id:target.id});state.annotations[key(target.side,target.jobId)]=Promise.resolve(result);if(state.job?.id!==target.jobId)return;reader?.redrawAnnotations(target.jobId,target.side,target.page,result.annotations||[]);state.selectedAnnotation=null;state.undo=null;msg("status","批注已删除。");}catch(error){if(state.job?.id===target.jobId)msg("status",error.message,"error");}}
-$("new-folder").addEventListener("click",()=>folderModal("create_folder"));$("submit-folder").addEventListener("click",submitFolder);$("submit-move").addEventListener("click",submitMove);$("open-import").addEventListener("click",()=>open("import-modal"));$("open-settings").addEventListener("click",()=>open("settings-modal"));$("open-translate").addEventListener("click",()=>{if(!state.job)return;$("translate-name").textContent=state.job.filename;open("translate-modal");});$("open-download").addEventListener("click",downloads);$("download-diagnostics").addEventListener("click",downloadDiagnostics);$("menu").addEventListener("click",()=>$("sidebar").classList.toggle("open"));
+$("new-folder").addEventListener("click",()=>folderModal("create_folder"));$("submit-folder").addEventListener("click",submitFolder);$("submit-move").addEventListener("click",submitMove);$("open-import").addEventListener("click",()=>open("import-modal"));$("open-settings").addEventListener("click",()=>open("settings-modal"));$("open-translate").addEventListener("click",async()=>{if(state.batch?.active)return;const selected=[...state.selectedJobIds];if(selected.length>1){openBatchTranslate(selected);return;}if(selected.length===1&&String(selected[0])!==String(state.job?.id))await select(selected[0]);if(!state.job)return;$("translate-name").textContent=state.job.filename;open("translate-modal");});$("selection-clear").addEventListener("click",clearSelection);$("submit-batch-translate").addEventListener("click",submitBatchTranslate);$("pick-folder").addEventListener("click",pickFolder);$("folder-input").addEventListener("change",event=>{chooseFolderFiles(event.target.files);event.target.value="";});$("open-download").addEventListener("click",downloads);$("download-diagnostics").addEventListener("click",downloadDiagnostics);$("menu").addEventListener("click",()=>$("sidebar").classList.toggle("open"));
 $("pick-file").addEventListener("click",()=>window.pywebview?.api?.import_pdf?submitImport():$("file-input").click());$("file-input").addEventListener("change",event=>choose(event.target.files[0]));$("import-action").addEventListener("change",importOptions);$("import-mode").addEventListener("change",importOptions);$("submit-import").addEventListener("click",submitImport);$("translate-mode").addEventListener("change",translateOptions);$("submit-translate").addEventListener("click",submitTranslate);$("save-settings").addEventListener("click",saveSettings);$("test-connection").addEventListener("click",testConnection);
-document.querySelectorAll("[data-close]").forEach(b=>b.addEventListener("click",()=>close(b.dataset.close)));$("submit-delete").addEventListener("click",submitDelete);document.querySelectorAll(".backdrop").forEach(b=>b.addEventListener("click",e=>{if(e.target===b)close(b.id);}));document.querySelectorAll("[data-file-action]").forEach(button=>button.addEventListener("click",()=>runFileMenuAction(button.dataset.fileAction)));document.querySelectorAll("[data-menu-icon]").forEach(icon=>{icon.innerHTML=uiIcons[icon.dataset.menuIcon]||"";});document.addEventListener("keydown",e=>{if($("file-context-menu").classList.contains("open")){const items=[...$("file-context-menu").querySelectorAll("[role=menuitem]")],index=items.indexOf(document.activeElement);if(e.key==="Escape"){e.preventDefault();closeFileMenu();return;}if(e.key==="ArrowDown"||e.key==="ArrowUp"){e.preventDefault();items[(index+(e.key==="ArrowDown"?1:-1)+items.length)%items.length]?.focus();return;}if(e.key==="Home"||e.key==="End"){e.preventDefault();items[e.key==="Home"?0:items.length-1]?.focus();return;}if(e.key==="Enter"||e.key===" "){if(index>=0){e.preventDefault();items[index].click();return;}}}if(e.key==="Escape"){$("annotation-menu").classList.remove("open");document.querySelectorAll(".backdrop.open").forEach(b=>close(b.id));}if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="o"){e.preventDefault();open("import-modal");}});document.addEventListener("pointerdown",event=>{if($("file-context-menu").classList.contains("open")&&!$("file-context-menu").contains(event.target)&&!event.target.closest?.(".file-menu-trigger,.file"))closeFileMenu(false);if(!$("annotation-menu").contains(event.target))$("annotation-menu").classList.remove("open");});
+document.querySelectorAll("[data-close]").forEach(b=>b.addEventListener("click",()=>close(b.dataset.close)));$("submit-delete").addEventListener("click",submitDelete);document.querySelectorAll(".backdrop").forEach(b=>b.addEventListener("click",e=>{if(e.target===b)close(b.id);}));document.querySelectorAll("[data-file-action]").forEach(button=>button.addEventListener("click",()=>runFileMenuAction(button.dataset.fileAction)));document.querySelectorAll("[data-menu-icon]").forEach(icon=>{icon.innerHTML=uiIcons[icon.dataset.menuIcon]||"";});document.addEventListener("keydown",e=>{if($("file-context-menu").classList.contains("open")){const items=[...$("file-context-menu").querySelectorAll("[role=menuitem]")],index=items.indexOf(document.activeElement);if(e.key==="Escape"){e.preventDefault();closeFileMenu();return;}if(e.key==="ArrowDown"||e.key==="ArrowUp"){e.preventDefault();items[(index+(e.key==="ArrowDown"?1:-1)+items.length)%items.length]?.focus();return;}if(e.key==="Home"||e.key==="End"){e.preventDefault();items[e.key==="Home"?0:items.length-1]?.focus();return;}if(e.key==="Enter"||e.key===" "){if(index>=0){e.preventDefault();items[index].click();return;}}}if(e.key==="Escape"){$("annotation-menu").classList.remove("open");document.querySelectorAll(".backdrop.open").forEach(b=>close(b.id));if(state.selectedJobIds.size)clearSelection();}if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="a"&&!isTypingTarget(e.target)&&!document.querySelector(".backdrop.open")){e.preventDefault();state.selectedJobIds=new Set(state.visibleJobIds);state.selectionAnchor=state.visibleJobIds[0]||null;renderList();updateActions();return;}if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="o"){e.preventDefault();open("import-modal");}});document.addEventListener("pointerdown",event=>{if($("file-context-menu").classList.contains("open")&&!$("file-context-menu").contains(event.target)&&!event.target.closest?.(".file-menu-trigger,.file"))closeFileMenu(false);if(!$("annotation-menu").contains(event.target))$("annotation-menu").classList.remove("open");});
 document.addEventListener("keydown",event=>{if(event.code!=="Space"||event.isComposing||isTypingTarget(event.target))return;if(event.repeat){if(panState.space)event.preventDefault();return;}event.preventDefault();panState.space=true;$("scroll").classList.add("space-pan");});document.addEventListener("keyup",event=>{if(event.code==="Space")clearPan();});window.addEventListener("blur",clearPan);$("scroll").addEventListener("pointerdown",startPan);$("scroll").addEventListener("pointermove",movePan);$("scroll").addEventListener("pointerup",endPan);$("scroll").addEventListener("pointercancel",endPan);$("scroll").addEventListener("lostpointercapture",endPan);
 document.querySelectorAll("[data-view]").forEach(b=>b.addEventListener("click",()=>{state.view=b.dataset.view;document.querySelectorAll("[data-view]").forEach(x=>x.classList.toggle("active",x===b));renderPage();}));$("prev").addEventListener("click",()=>page(-1));$("next").addEventListener("click",()=>page(1));$("page-number").addEventListener("change",()=>{const target=Math.min(Math.max(1,Number($("page-number").value)||1),Number(state.job?.page_count)||1);if(reader)reader.goToPage(target);else{state.page=target;renderPage();}});$("zoom-out").addEventListener("click",()=>zoom(-10));$("zoom-in").addEventListener("click",()=>zoom(10));
 document.querySelectorAll("[data-color]").forEach(button=>button.addEventListener("click",()=>addAnnotation("highlight",button.dataset.color)));$("annotation-underline").addEventListener("click",()=>addAnnotation("underline","#FFE066"));$("annotation-menu").addEventListener("mousedown",event=>event.preventDefault());$("annotation-delete").addEventListener("click",()=>deleteAnnotation(state.selectedAnnotation));$("annotation-undo").addEventListener("click",()=>deleteAnnotation(state.undo));
@@ -255,5 +491,5 @@ $("scroll").addEventListener("wheel",event=>{if(!event.ctrlKey||!state.job)retur
 $("submit-folder-delete").addEventListener("click",submitFolderDelete);
 $("file-input").addEventListener("change",event=>chooseFiles(event.target.files));
 $("open-import").addEventListener("click",openImportModal);
-initSidebar();initAgent();const agentPanel=createAgentPanel({getJob:()=>state.job,getPage:()=>state.page});reader=new ContinuousReader({scroller:$("scroll"),pages:$("pages"),getDocument:documentFor,getAnnotations:annotationsFor,onPageChange:pageNumber=>{state.page=pageNumber;$("page-number").value=pageNumber;agentPanel.setPage(pageNumber);},onSelection:handleReaderSelection,onSelectionError:handleReaderSelectionError,onAnnotationClick:handleReaderAnnotationClick,onError:handleReaderError});
+initSidebar();initAgent();initFileDrop();const agentPanel=createAgentPanel({getJob:()=>state.job,getPage:()=>state.page});reader=new ContinuousReader({scroller:$("scroll"),pages:$("pages"),getDocument:documentFor,getAnnotations:annotationsFor,onPageChange:pageNumber=>{state.page=pageNumber;$("page-number").value=pageNumber;agentPanel.setPage(pageNumber);},onSelection:handleReaderSelection,onSelectionError:handleReaderSelectionError,onAnnotationClick:handleReaderAnnotationClick,onError:handleReaderError});
 importOptions();translateOptions();loadSettings();loadLibrary().then(loadJobs);

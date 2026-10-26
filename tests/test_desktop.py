@@ -17,7 +17,7 @@ class DesktopBridgeTests(unittest.TestCase):
         bridge = DesktopBridge()
         bridge._window = object()
         public = {name for name in dir(bridge) if not name.startswith("_")}
-        self.assertEqual(public, {"import_pdf", "save_translation", "save_diagnostics", "copy_markdown_directory", "get_workspace_preferences", "save_workspace_preferences"})
+        self.assertEqual(public, {"import_pdf", "import_folder", "save_translation", "save_diagnostics", "copy_markdown_directory", "get_workspace_preferences", "save_workspace_preferences"})
 
     def _bundle(self):
         temporary = tempfile.TemporaryDirectory()

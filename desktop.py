@@ -228,6 +228,54 @@ class DesktopBridge:
         finally:
             self._import_lock.release()
 
+    def import_folder(self, options: dict | None = None) -> dict:
+        """Native folder picker; import every PDF under the chosen folder."""
+        options = options if isinstance(options, dict) else {}
+        if options.get("action", "import") != "import":
+            return {"error": "文件夹导入仅支持“仅导入，稍后翻译”。"}
+        if self._window is None:
+            return {"error": "桌面窗口尚未就绪。"}
+        if not self._import_lock.acquire(blocking=False):
+            return {"error": "已有导入正在进行，请稍候。"}
+        try:
+            import webview
+            from app.core import MAX_FOLDER_PDFS, import_job_from_path, list_folder_pdfs
+
+            chosen = self._window.create_file_dialog(webview.FileDialog.FOLDER)
+            if not chosen:
+                return {"cancelled": True}
+            folder_value = chosen[0] if isinstance(chosen, (list, tuple)) else chosen
+            folder = Path(str(folder_value))
+            paths = list_folder_pdfs(folder, MAX_FOLDER_PDFS + 1)
+            truncated = len(paths) > MAX_FOLDER_PDFS
+            paths = paths[:MAX_FOLDER_PDFS]
+            if not paths:
+                return {"results": [], "total": 0, "truncated": False}
+            results = []
+            for path in paths:
+                try:
+                    relative = path.relative_to(folder).as_posix()
+                except ValueError:
+                    relative = path.name
+                try:
+                    job = import_job_from_path(
+                        str(path), mode="full", pages="", demo_mode=False, start_translation=False
+                    )
+                except Exception as exc:
+                    results.append({"filename": relative, "error": self._import_error(exc)})
+                else:
+                    duplicate = bool(job.get("duplicate"))
+                    results.append({
+                        "filename": relative,
+                        "job": {"id": job["id"], "duplicate": duplicate, "message": job.get("message", "")},
+                        "duplicate": duplicate,
+                    })
+            return {"results": results, "total": len(paths), "truncated": truncated}
+        except (ValueError, OSError) as exc:
+            return {"error": str(exc)}
+        finally:
+            self._import_lock.release()
+
     def save_translation(self, job_id: str) -> dict:
         """Native Save As for a verified translated PDF only."""
         import webview

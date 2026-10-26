@@ -23,7 +23,7 @@ from .annotations import (
     get_annotations,
 )
 from . import agent
-from .core import DATA, JOBS, MAX_UPLOAD_BYTES, create_job, create_job_from_path, file_path, get_workspace_preferences, list_jobs, load_job, public_settings, read_settings, render_page, save_settings, save_workspace_preferences, translate_job
+from .core import DATA, JOBS, MAX_UPLOAD_BYTES, create_job, create_job_from_path, file_path, get_workspace_preferences, list_jobs, load_job, public_settings, read_settings, recover_interrupted_jobs, render_page, save_settings, save_workspace_preferences, translate_job
 from .library import MAX_LIBRARY_BODY_BYTES, apply_action, get_library
 from .markdown_export import MarkdownExportError, markdown_directory
 from .diagnostics import MAX_CLIENT_ERROR_BYTES, client_error, export_bytes, record_exception as diagnostic_exception
@@ -505,6 +505,11 @@ class Handler(BaseHTTPRequestHandler):
 def run() -> None:
     DATA.mkdir(exist_ok=True)
     JOBS.mkdir(exist_ok=True)
+    try:
+        for job_id in recover_interrupted_jobs():
+            print(f"已恢复中断的翻译任务：{job_id}")
+    except Exception as exc:
+        diagnostic_exception("startup_recovery_failed", exc, fields={"phase": "startup"})
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"论文双语阅读器已启动：http://{HOST}:{PORT}")
     try:

@@ -47,6 +47,7 @@ else:
     SETTINGS_PATH = DATA / "settings.json"
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_LOCAL_IMPORT_BYTES = MAX_UPLOAD_BYTES
+MAX_FOLDER_PDFS = 2000
 EXTERNAL_SOURCE_META_NAME = "external-source.json"
 
 DEFAULT_SETTINGS = {
@@ -65,6 +66,7 @@ _sha_cache: dict[tuple[str, int, int, int], str] = {}
 _markdown_scheduled: set[str] = set()
 _active_jobs: set[str] = set()
 _deleted_jobs: set[str] = set()
+_recovered_interrupts = False
 
 
 def ensure_dirs() -> None:
@@ -783,6 +785,64 @@ def list_jobs() -> list[dict[str, Any]]:
             "error": row.get("error"), "demo_mode": bool(row.get("demo_mode")),
         })
     return sorted(result, key=lambda x: x.get("created_at", ""), reverse=True)
+
+
+def list_folder_pdfs(folder: str | Path, limit: int = MAX_FOLDER_PDFS) -> list[Path]:
+    """Return PDF files under a user-selected folder (recursive, bounded)."""
+    root = Path(folder)
+    if not root.is_dir():
+        raise ValueError("所选路径不是文件夹。")
+    paths: list[Path] = []
+    for path in root.rglob("*"):
+        try:
+            if path.is_file() and path.suffix.lower() == ".pdf":
+                paths.append(path)
+        except OSError:
+            continue
+        if len(paths) >= limit:
+            break
+    return sorted(paths, key=lambda item: str(item).lower())
+
+
+def recover_interrupted_jobs() -> list[str]:
+    """Mark jobs left running/queued by a previous process as failed.
+
+    Workers live in the desktop process, so after a restart no translation can
+    still be running.  Leaving the stale row as running would block retries and
+    poll forever, so make the interruption explicit and retryable.
+    """
+    global _recovered_interrupts
+    with _lock:
+        if _recovered_interrupts:
+            return []
+        _recovered_interrupts = True
+        recovered: list[str] = []
+        try:
+            rows = catalog.list_documents(DATA)
+        except Exception:
+            return recovered
+        for row in rows:
+            if row.get("status") not in {"running", "queued"}:
+                continue
+            job_id = str(row.get("job_id") or "")
+            if not job_id:
+                continue
+            job = load_job(job_id)
+            if not job or job.get("status") not in {"running", "queued"}:
+                continue
+            job.update(
+                status="failed",
+                progress=None,
+                progress_indeterminate=True,
+                stage="failed",
+                error="上次运行被中断，请重新翻译。",
+            )
+            try:
+                save_job(job)
+            except Exception:
+                continue
+            recovered.append(job_id)
+        return recovered
 
 
 def _find_babeldoc() -> list[str] | None:

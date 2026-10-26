@@ -48,9 +48,13 @@
         <span class="title" id="title">选择一篇论文</span>
       </div>
       <div class="top-actions">
+        <div class="selection-chip" id="selection-chip" hidden>
+          <span id="selection-count"></span>
+          <button type="button" id="selection-clear" title="取消选择">取消</button>
+        </div>
         <button id="open-translate" class="btn" disabled>
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4h6M5 2v2c0 2-1.5 3.5-3.5 4.5M8.5 4c0 2 1.5 3.5 3.5 4.5"/><path d="m9.5 13.5 2-5 2 5M10.2 12h2.6"/></svg>
-          翻译
+          <span id="translate-label">翻译</span>
         </button>
         <button id="open-download" class="btn" disabled>
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v7.5M4.8 6.8 8 10l3.2-3.2M2.5 11v2a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-2"/></svg>
@@ -77,6 +81,10 @@
     <div class="progress-wrap" id="progress-wrap" hidden>
       <div class="progress-copy"><span id="progress-stage">正在准备</span><span id="progress-value">处理中</span></div>
       <div class="progress-track"><div id="progress-fill"></div></div>
+    </div>
+    <div class="progress-wrap" id="batch-progress-wrap" hidden>
+      <div class="progress-copy"><span id="batch-progress-stage">批量翻译</span><span id="batch-progress-value"></span></div>
+      <div class="progress-track"><div id="batch-progress-fill"></div></div>
     </div>
     <div class="scroll" id="scroll">
       <div class="empty" id="empty">
@@ -162,7 +170,9 @@
     <button class="close" data-close="import-modal">×</button>
     <h2>导入论文</h2>
     <input type="file" accept=".pdf,application/pdf" id="file-input" multiple hidden>
+    <input type="file" id="folder-input" webkitdirectory directory multiple hidden>
     <button class="pick" id="pick-file">点击选择 PDF（最大 100 MB）</button>
+    <button class="pick pick-folder" id="pick-folder">选择文件夹，导入其中的全部 PDF</button>
     <div class="help" id="import-selection" aria-live="polite">未选择文件</div>
     <label class="field">导入后处理
       <select id="import-action">
@@ -188,6 +198,16 @@
     <div class="msg" id="import-msg"></div>
     <div class="msg" id="import-summary" hidden></div>
     <div class="actions"><button data-close="import-modal">取消</button><button class="primary" id="submit-import">导入</button></div>
+  </div>
+</div>
+<div class="backdrop" id="batch-translate-modal">
+  <div class="modal">
+    <button class="close" data-close="batch-translate-modal">×</button>
+    <h2>批量翻译</h2>
+    <p class="help" id="batch-translate-summary"></p>
+    <p class="help">按每批 3 篇执行全文翻译；已完成的会自动跳过。翻译会调用已配置的 API 并产生费用。</p>
+    <div class="msg" id="batch-translate-msg"></div>
+    <div class="actions"><button data-close="batch-translate-modal">取消</button><button class="primary" id="submit-batch-translate">开始翻译</button></div>
   </div>
 </div>
 <div class="backdrop" id="translate-modal">
