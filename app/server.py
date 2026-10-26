@@ -23,7 +23,7 @@ from .annotations import (
     get_annotations,
 )
 from . import agent
-from .core import DATA, JOBS, MAX_UPLOAD_BYTES, create_job, create_job_from_path, file_path, get_workspace_preferences, list_jobs, load_job, public_settings, read_settings, recover_interrupted_jobs, render_page, save_settings, save_workspace_preferences, translate_job
+from .core import DATA, JOBS, MAX_UPLOAD_BYTES, cleanup_completed_intermediates, create_job, create_job_from_path, file_path, get_workspace_preferences, list_jobs, load_job, public_settings, read_settings, recover_interrupted_jobs, render_page, save_settings, save_workspace_preferences, translate_job
 from .library import MAX_LIBRARY_BODY_BYTES, apply_action, get_library
 from .memo import read_memo, save_memo
 from .markdown_export import MarkdownExportError, markdown_directory
@@ -533,6 +533,9 @@ def run() -> None:
     try:
         for job_id in recover_interrupted_jobs():
             print(f"已恢复中断的翻译任务：{job_id}")
+        cleaned = cleanup_completed_intermediates()
+        if cleaned:
+            print(f"已清理 {cleaned} 篇文献的翻译中间文件")
     except Exception as exc:
         diagnostic_exception("startup_recovery_failed", exc, fields={"phase": "startup"})
     server = ThreadingHTTPServer((HOST, PORT), Handler)

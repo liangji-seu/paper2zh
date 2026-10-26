@@ -67,6 +67,7 @@ _markdown_scheduled: set[str] = set()
 _active_jobs: set[str] = set()
 _deleted_jobs: set[str] = set()
 _recovered_interrupts = False
+INTERMEDIATE_DIR_NAMES = ("babeldoc-work", "babeldoc-output")
 
 
 def ensure_dirs() -> None:
@@ -898,6 +899,40 @@ def _engine_output_pdfs(output_dir: Path, started_at: float) -> list[Path]:
     return candidates
 
 
+def _cleanup_job_intermediates(job_id: str) -> None:
+    """Remove BabelDOC scratch dirs once the final PDFs are published."""
+    job_dir = JOBS / str(job_id)
+    for name in INTERMEDIATE_DIR_NAMES:
+        target = job_dir / name
+        try:
+            if target.is_symlink():
+                target.unlink(missing_ok=True)
+            elif target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def cleanup_completed_intermediates() -> int:
+    """Best-effort startup sweep for scratch dirs left by old versions."""
+    cleaned = 0
+    if not JOBS.is_dir():
+        return cleaned
+    for job_dir in JOBS.iterdir():
+        if not job_dir.is_dir():
+            continue
+        job = load_job(job_dir.name)
+        if not job or job.get("status") != "completed":
+            continue
+        relative = job.get("translated_file")
+        if not relative or not (job_dir / str(relative)).is_file():
+            continue
+        if any((job_dir / name).exists() for name in INTERMEDIATE_DIR_NAMES):
+            _cleanup_job_intermediates(job_dir.name)
+            cleaned += 1
+    return cleaned
+
+
 def _run_babeldoc(job: dict[str, Any], settings: dict[str, Any]) -> tuple[Path, Path]:
     command = _find_babeldoc()
     if not command:
@@ -1128,6 +1163,7 @@ def _worker(job: dict[str, Any]) -> None:
             if warning:
                 job["message"] = f"已复用同源全文译文，未再次调用 API。{warning}"
             save_job(job)
+            _cleanup_job_intermediates(job_id)
             _enqueue_markdown_export(job)
             diagnostic("translation_finished", job_id=job_id, fields={"status": "reused", "phase": "worker"})
             return
@@ -1168,6 +1204,7 @@ def _worker(job: dict[str, Any]) -> None:
         _record_engine_usage(job)
     save_job(job)
     if job.get("status") == "completed":
+        _cleanup_job_intermediates(job_id)
         diagnostic("translation_finished", job_id=job_id, fields={"status": "completed", "phase": "worker"})
     _enqueue_markdown_export(job)
 
