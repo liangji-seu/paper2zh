@@ -72,10 +72,12 @@ class CoreTests(unittest.TestCase):
             response.__enter__.return_value = response
             response.__exit__.return_value = False
             response.read.return_value = b"{}"
-            with patch.object(server.urllib.request, "urlopen", return_value=response) as call:
+            opener = MagicMock()
+            opener.open.return_value = response
+            with patch.object(server.urllib.request, "build_opener", return_value=opener) as build:
                 result = server.test_connection()
             self.assertTrue(result["ok"])
-            request = call.call_args.args[0]
+            request = opener.open.call_args.args[0]
             self.assertIn("Bearer sk-test-secret", request.headers.get("Authorization", ""))
             self.assertIn(b"max_tokens", request.data)
 

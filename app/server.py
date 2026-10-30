@@ -73,7 +73,8 @@ def test_connection() -> dict[str, object]:
     request_body = json_bytes({"model": settings["model"], "messages": [{"role": "user", "content": "Reply with OK only."}], "max_tokens": 1, "temperature": 0})
     request = urllib.request.Request(url, data=request_body, method="POST", headers={"Content-Type": "application/json", "Authorization": f"Bearer {settings['api_key']}"})
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=20) as response:
             response.read(4096)
         return {"ok": True, "category": "ok", "message": "连接成功：已用 max_tokens=1 验证认证和模型。", "model": settings["model"]}
     except urllib.error.HTTPError as exc:

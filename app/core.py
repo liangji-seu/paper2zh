@@ -933,6 +933,16 @@ def cleanup_completed_intermediates() -> int:
     return cleaned
 
 
+def _no_proxy_with_host(existing: str | None, host: str) -> str:
+    """Add the API host to NO_PROXY without discarding user entries."""
+    entries = [entry.strip() for entry in (existing or "").split(",") if entry.strip()]
+    if any(entry == "*" for entry in entries):
+        return "*"
+    if host and not any(entry.lower() == host.lower() for entry in entries):
+        entries.append(host)
+    return ",".join(entries)
+
+
 def _run_babeldoc(job: dict[str, Any], settings: dict[str, Any]) -> tuple[Path, Path]:
     command = _find_babeldoc()
     if not command:
@@ -973,6 +983,14 @@ def _run_babeldoc(job: dict[str, Any], settings: dict[str, Any]) -> tuple[Path, 
             args += ["--pages", job["pages"]]
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
+        api_host = urlparse(settings["base_url"]).hostname
+        if api_host:
+            # A broken local/system proxy can reset TLS handshakes for the API
+            # host while direct access works. Keep other hosts on the proxy,
+            # but let BabelDOC/httpx reach the configured API directly.
+            bypass = _no_proxy_with_host(env.get("NO_PROXY") or env.get("no_proxy"), api_host)
+            env["NO_PROXY"] = bypass
+            env["no_proxy"] = bypass
         process = subprocess.Popen(args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, env=env, **_hidden_process_kwargs())
         lines: queue.Queue[str | None] = queue.Queue()
 
