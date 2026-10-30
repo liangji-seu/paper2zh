@@ -115,6 +115,20 @@ aside.sidebar{
   border-right:1px solid var(--line);
 }
 .side-head{padding:7px 8px 4px;flex:none}
+.side-search{
+  display:flex;align-items:center;gap:6px;flex:none;
+  margin:2px 8px 6px;padding:0 8px;height:31px;
+  background:var(--panel);border:1px solid var(--line);border-radius:7px;
+}
+.side-search:focus-within{border-color:color-mix(in srgb,var(--brand) 50%,var(--line));box-shadow:0 0 0 2px color-mix(in srgb,var(--brand) 10%,transparent)}
+.side-search>svg{width:14px;height:14px;flex:none;color:var(--muted);fill:none;stroke:currentColor;stroke-width:1.3;stroke-linecap:round}
+.side-search input{flex:1;min-width:0;border:0;outline:0;background:transparent;color:var(--ink);font:12px var(--font)}
+.side-search input::placeholder{color:var(--muted)}
+.side-search input::-webkit-search-cancel-button{display:none}
+.search-clear{display:grid;place-items:center;width:18px;height:18px;flex:none;border:0;border-radius:4px;background:transparent;color:var(--muted);font-size:14px;line-height:1;cursor:pointer}
+.search-clear:hover{background:var(--hover);color:var(--ink)}
+.search-kbd{flex:none;padding:0 4px;border:1px solid var(--line);border-radius:3px;color:var(--muted);font:10px var(--mono);line-height:15px}
+.side-search:focus-within .search-kbd{display:none}
 .vault-row{display:flex;align-items:center;gap:6px;height:30px;padding:0 4px 0 6px}
 .brand{display:flex;align-items:center;gap:7px;min-width:0;font-size:13px;font-weight:600;letter-spacing:-.01em}
 .brand-icon{width:18px;height:18px;border-radius:5px;flex:none}

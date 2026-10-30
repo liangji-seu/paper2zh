@@ -24,6 +24,12 @@
         </div>
       </div>
     </div>
+    <div class="side-search">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.8" cy="6.8" r="4.3"/><path d="m10 10 3.4 3.4"/></svg>
+      <input id="library-search" type="search" placeholder="搜索标题、文件名或文件夹…" autocomplete="off" spellcheck="false" aria-label="搜索文献库">
+      <button id="clear-search" class="search-clear" type="button" title="清除搜索" aria-label="清除搜索" hidden>×</button>
+      <kbd class="search-kbd" aria-hidden="true">/</kbd>
+    </div>
     <div class="side-body">
       <div class="files" id="files"><div class="files-empty">还没有论文。</div></div>
     </div>
@@ -178,6 +184,9 @@
     <button class="pick" id="pick-file">点击选择 PDF（最大 100 MB）</button>
     <button class="pick pick-folder" id="pick-folder">选择文件夹，导入其中的全部 PDF</button>
     <div class="help" id="import-selection" aria-live="polite">未选择文件</div>
+    <label class="field">导入到
+      <select id="import-folder"></select>
+    </label>
     <label class="field">导入后处理
       <select id="import-action">
         <option value="import">仅导入，稍后翻译</option>
